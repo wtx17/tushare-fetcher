@@ -145,6 +145,7 @@ def run_update(args: argparse.Namespace) -> int:
             as_of,
             args.financial_lookback_quarters,
             args.event_lookback_days,
+            args.daily_lookback_days,
         )
         LOGGER.info("updating %s with %s target partition(s)", spec.name, len(targets))
         try:
@@ -187,6 +188,8 @@ def _smoke_params(spec: DatasetSpec, args: argparse.Namespace) -> dict[str, Any]
         return params
     if spec.mode == "event":
         return {"start_date": args.event_start, "end_date": args.event_end}
+    if spec.mode == "daily":
+        return {"trade_date": args.trade_date}
     return {"is_new": "Y"}
 
 
@@ -343,6 +346,12 @@ def build_parser() -> argparse.ArgumentParser:
     update.add_argument("--financial-lookback-quarters", type=int, default=8)
     update.add_argument("--event-lookback-days", type=int, default=365)
     update.add_argument(
+        "--daily-lookback-days",
+        type=int,
+        default=7,
+        help="refresh this many recent calendar dates for daily datasets",
+    )
+    update.add_argument(
         "--allow-shrink",
         action="store_true",
         help="permit overwriting an existing partition with fewer rows than stored",
@@ -358,6 +367,7 @@ def build_parser() -> argparse.ArgumentParser:
     smoke.add_argument("--period", default="20241231")
     smoke.add_argument("--event-start", default="20240101")
     smoke.add_argument("--event-end", default="20240131")
+    smoke.add_argument("--trade-date", default="20240102")
     smoke.set_defaults(handler=run_smoke)
     return parser
 
@@ -384,6 +394,8 @@ def validate_cli_args(args: argparse.Namespace) -> None:
         raise ConfigurationError("--financial-lookback-quarters must be at least 1")
     if hasattr(args, "event_lookback_days") and args.event_lookback_days < 1:
         raise ConfigurationError("--event-lookback-days must be at least 1")
+    if hasattr(args, "daily_lookback_days") and args.daily_lookback_days < 1:
+        raise ConfigurationError("--daily-lookback-days must be at least 1")
 
 
 def main(argv: Sequence[str] | None = None) -> int:

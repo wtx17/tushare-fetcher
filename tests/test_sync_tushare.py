@@ -20,13 +20,14 @@ EXPECTED_FIELD_COUNTS = {
     "stk_holdertrade": 13,
     "index_member_all": 11,
     "ci_index_member": 11,
+    "daily_basic": 19,
 }
 
 
 def test_parse_all_documented_fields() -> None:
     parsed = sync.load_all_fields(sync.DEFAULT_DOCS_DIR)
     assert {name: len(fields) for name, fields in parsed.items()} == EXPECTED_FIELD_COUNTS
-    assert sum(EXPECTED_FIELD_COUNTS.values()) == 599
+    assert sum(EXPECTED_FIELD_COUNTS.values()) == 618
     for fields in parsed.values():
         assert len({field.name for field in fields}) == len(fields)
 
@@ -43,6 +44,9 @@ def test_rolling_ten_year_quarters_and_event_years() -> None:
     assert years[0] == ("2016", "20160720", "20161231")
     assert years[-1] == ("2026", "20260101", "20260720")
     assert len(years) == 11
+
+    dates = sync.calendar_dates(dt.date(2024, 1, 30), dt.date(2024, 2, 2))
+    assert dates == ["20240130", "20240131", "20240201", "20240202"]
 
 
 def test_normalize_known_missing_fields_and_reject_other_missing() -> None:
@@ -195,6 +199,99 @@ def test_update_targets_add_missing_and_refresh_recent() -> None:
         event_lookback_days=365,
     )
     assert targets == [("20240630", {"period": "20240630"})]
+
+
+def test_daily_targets_use_one_trade_date_per_partition() -> None:
+    spec = sync.DATASET_BY_NAME["daily_basic"]
+    targets = sync.targets_for_range(
+        spec,
+        dt.date(2024, 1, 1),
+        dt.date(2024, 1, 3),
+    )
+    assert targets == [
+        ("20240101", {"trade_date": "20240101"}),
+        ("20240102", {"trade_date": "20240102"}),
+        ("20240103", {"trade_date": "20240103"}),
+    ]
+
+
+def test_daily_fetch_queries_and_validates_one_trade_date() -> None:
+    spec = sync.DATASET_BY_NAME["daily_basic"]
+    fields = sync.parse_output_fields(sync.DEFAULT_DOCS_DIR / spec.doc_name)
+    calls: list[dict[str, object]] = []
+
+    def fake_query(_api: str, _fields: str, params: dict[str, object]) -> pd.DataFrame:
+        calls.append(dict(params))
+        values: dict[str, object] = {}
+        for field in fields:
+            if field.name in sync.KNOWN_DAILY_BASIC_MISSING_FIELDS:
+                continue
+            if field.name == "ts_code":
+                values[field.name] = "000001.SZ"
+            elif field.name == "trade_date":
+                values[field.name] = "20240102"
+            elif field.pandas_dtype == "Float64":
+                values[field.name] = "1.0"
+            elif field.pandas_dtype == "Int64":
+                values[field.name] = "1"
+            else:
+                values[field.name] = "sample"
+        return pd.DataFrame([values])
+
+    fetcher = sync.ApiFetcher(
+        token="test-token",
+        api_url="https://example.invalid",
+        query_override=fake_query,
+        request_interval=0,
+    )
+    frame, stats = sync.fetch_daily_partition(fetcher, spec, fields, "20240102")
+
+    assert calls == [{"trade_date": "20240102", "limit": 6000, "offset": 0}]
+    assert frame["trade_date"].tolist() == ["20240102"]
+    assert frame["limit_status"].dtype.name == "Int64"
+    assert frame["limit_status"].isna().all()
+    assert stats["pages"] == 1
+    assert stats["missing_fields"] == ["limit_status"]
+    assert stats["warnings"] == ["source omitted documented fields: limit_status"]
+
+    invalid = frame.copy()
+    invalid["trade_date"] = "20240103"
+    with pytest.raises(sync.SourceSchemaError, match="other trade_date"):
+        sync.validate_daily_frame(invalid, "20240102", spec.name)
+
+    with pytest.raises(sync.SourceSchemaError, match="close"):
+        sync.normalize_frame(
+            frame.drop(columns=["close"]),
+            fields,
+            allowed_missing_fields=spec.allowed_missing_fields,
+            dataset_name=spec.name,
+        )
+
+
+def test_daily_update_refreshes_recent_dates_and_fills_gaps() -> None:
+    spec = sync.DATASET_BY_NAME["daily_basic"]
+    manifest = {
+        "partitions": {
+            "20240101": {},
+            "20240103": {},
+            "20240104": {},
+            "20240105": {},
+        }
+    }
+    targets = sync.update_targets(
+        spec,
+        manifest,
+        archive_start=dt.date(2024, 1, 1),
+        as_of=dt.date(2024, 1, 5),
+        financial_lookback_quarters=1,
+        event_lookback_days=1,
+        daily_lookback_days=2,
+    )
+    assert targets == [
+        ("20240102", {"trade_date": "20240102"}),
+        ("20240104", {"trade_date": "20240104"}),
+        ("20240105", {"trade_date": "20240105"}),
+    ]
 
 
 def test_proxy_concurrency_is_rejected_before_download() -> None:

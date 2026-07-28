@@ -60,6 +60,8 @@ KNOWN_EXPRESS_MISSING_FIELDS = frozenset(
     }
 )
 
+KNOWN_DAILY_BASIC_MISSING_FIELDS = frozenset({"limit_status"})
+
 
 class SyncError(RuntimeError):
     """Base exception for controlled synchronization failures."""
@@ -173,6 +175,16 @@ DATASET_SPECS: tuple[DatasetSpec, ...] = (
     ),
     DatasetSpec("balancesheet", "balancesheet_vip", "balancesheet.md", "statement", 5_000),
     DatasetSpec("cashflow", "cashflow_vip", "cashflow.md", "statement", 5_000),
+    # daily_basic only returns one trade date per market-wide query, so it is
+    # deliberately partitioned and requested one calendar date at a time.
+    DatasetSpec(
+        "daily_basic",
+        "daily_basic",
+        "daily_basic.md",
+        "daily",
+        6_000,
+        KNOWN_DAILY_BASIC_MISSING_FIELDS,
+    ),
 )
 
 DATASET_BY_NAME = {spec.name: spec for spec in DATASET_SPECS}
@@ -222,6 +234,17 @@ def event_year_ranges(start_date: dt.date, end_date: dt.date) -> list[tuple[str,
     return result
 
 
+def calendar_dates(start_date: dt.date, end_date: dt.date) -> list[str]:
+    """Return every calendar date in the closed interval as YYYYMMDD."""
+    if start_date > end_date:
+        raise ConfigurationError("start_date must not be after end_date")
+    day_count = (end_date - start_date).days + 1
+    return [
+        format_date(start_date + dt.timedelta(days=offset))
+        for offset in range(day_count)
+    ]
+
+
 __all__ = [
     "LOGGER",
     "SCRIPT_DIR",
@@ -233,6 +256,7 @@ __all__ = [
     "CATALOG_VERSION",
     "KNOWN_INCOME_MISSING_FIELDS",
     "KNOWN_EXPRESS_MISSING_FIELDS",
+    "KNOWN_DAILY_BASIC_MISSING_FIELDS",
     "SyncError",
     "ConfigurationError",
     "SourceSchemaError",
@@ -251,4 +275,5 @@ __all__ = [
     "format_date",
     "quarter_ends",
     "event_year_ranges",
+    "calendar_dates",
 ]

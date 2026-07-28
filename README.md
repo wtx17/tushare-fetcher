@@ -1,6 +1,6 @@
 # tushare-sync
 
-从 Tushare API 拉取财务、股东、行业分类等 A 股数据，本地存储为分区 Parquet 文件。
+从 Tushare API 拉取财务、股东、行业分类、每日指标等 A 股数据，本地存储为分区 Parquet 文件。
 
 ## 环境准备
 
@@ -35,6 +35,7 @@ python sync_tushare.py smoke
 | `--apis fina_indicator,income` | 只同步指定数据集（默认 `all`） |
 | `--output-dir ./data` | 输出目录 |
 | `--workers 1` | 并发拉取数 （api限制，默认为1，不能并发）|
+| `--daily-lookback-days 7` | 增量更新时重新拉取最近若干个自然日的每日指标 |
 | `--force` | 强制重新下载已校验的分区 |
 | `--allow-shrink` | 允许新数据行数少于旧数据 |
 | `--log-level DEBUG` | 调试日志 |
@@ -53,6 +54,7 @@ python sync_tushare.py smoke
 | `stk_holdertrade` | 股东增减持 |
 | `index_member_all` | 申万行业成分 |
 | `ci_index_member` | 中信行业成分 |
+| `daily_basic` | 每日指标（按交易日期逐日请求全市场） |
 
 ## 本地数据结构
 
@@ -65,6 +67,9 @@ data/
 ├── stk_holdernumber/
 │   ├── _manifest.json
 │   └── ann_year/2026/data.parquet
+├── daily_basic/
+│   ├── _manifest.json
+│   └── trade_date/20260720/data.parquet
 └── index_member_all/
     ├── _manifest.json
     └── data.parquet
@@ -75,5 +80,6 @@ data/
 - **Schema 来自文档**：字段定义从 `使用说明/` 目录的 Markdown 解析，与 Tushare API 文档同步。
   - 只有写在 `_models.py` 中的数据集会被解析
 - **崩溃可恢复**：每个分区完成后原子更新 manifest，中断后重跑会自动跳过已完成分区。
+- **每日指标逐日拉取**：`daily_basic` 每次只查询一个 `trade_date`，按自然日独立分区；非交易日的空分区用于记录该日已完成查询。当前第三方端口缺少的 `limit_status` 会补为可空整数。
 - **防误覆盖**：拒绝用更少行数的分区覆盖已有数据（常见于 API 限流），除非加 `--force`。
 - **离线校验**：`verify` 命令检查校验和、行数、schema、日期约束，无需网络。

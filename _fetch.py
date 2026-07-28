@@ -26,6 +26,7 @@ from _schema import (
     normalize_frame,
     period_is_historical,
     row_hashes,
+    validate_daily_frame,
     validate_event_frame,
     validate_period_frame,
 )
@@ -345,6 +346,31 @@ def fetch_event_partition(
     return result.frame, stats
 
 
+def fetch_daily_partition(
+    fetcher: ApiFetcher,
+    spec: DatasetSpec,
+    fields: Sequence[FieldSpec],
+    trade_date: str,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    # daily_basic's date-range parameters do not provide a market-wide range
+    # download.  Each partition therefore uses exactly one trade_date query.
+    result = fetcher.fetch_paginated(
+        spec,
+        fields,
+        {"trade_date": trade_date},
+    )
+    validate_daily_frame(result.frame, trade_date, spec.name)
+    stats = {
+        "raw_rows": result.raw_rows,
+        "pages": result.pages,
+        "last_page_rows": result.last_page_rows,
+        "cross_page_duplicates": result.cross_page_duplicates,
+        "missing_fields": sorted(result.missing_fields),
+        "warnings": result.warnings,
+    }
+    return result.frame, stats
+
+
 def fetch_industry_partition(
     fetcher: ApiFetcher,
     spec: DatasetSpec,
@@ -417,5 +443,6 @@ __all__ = [
     "fetch_period_partition",
     "fetch_statement_partition",
     "fetch_event_partition",
+    "fetch_daily_partition",
     "fetch_industry_partition",
 ]

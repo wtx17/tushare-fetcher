@@ -19,6 +19,7 @@ import pyarrow.parquet as pyarrow_parquet
 
 from _fetch import (
     ApiFetcher,
+    fetch_daily_partition,
     fetch_event_partition,
     fetch_industry_partition,
     fetch_period_partition,
@@ -37,6 +38,7 @@ from _models import (
     SchemaDriftError,
     SourceSchemaError,
     SyncError,
+    calendar_dates,
     event_year_ranges,
     format_date,
     now_iso,
@@ -47,6 +49,7 @@ from _schema import (
     industry_overlap_mask,
     schema_hash,
     schema_payload,
+    validate_daily_frame,
     validate_event_frame,
     validate_period_frame,
 )
@@ -129,6 +132,8 @@ def partition_file(output_dir: Path, spec: DatasetSpec, key: str) -> Path:
         return root / "period" / key / "data.parquet"
     if spec.mode == "event":
         return root / "ann_year" / key / "data.parquet"
+    if spec.mode == "daily":
+        return root / "trade_date" / key / "data.parquet"
     if spec.mode == "industry":
         return root / "data.parquet"
     raise AssertionError(f"unknown dataset mode: {spec.mode}")
@@ -303,6 +308,13 @@ def _run_partition_task(
             query["start_date"],
             query["end_date"],
         )
+    elif spec.mode == "daily":
+        frame, stats = fetch_daily_partition(
+            fetcher,
+            spec,
+            fields,
+            query["trade_date"],
+        )
     elif spec.mode == "industry":
         frame, stats = fetch_industry_partition(
             fetcher,
@@ -334,6 +346,11 @@ def targets_for_range(
             (year, {"start_date": lower, "end_date": upper})
             for year, lower, upper in event_year_ranges(start_date, end_date)
         ]
+    if spec.mode == "daily":
+        return [
+            (trade_date, {"trade_date": trade_date})
+            for trade_date in calendar_dates(start_date, end_date)
+        ]
     if spec.mode == "industry":
         return [
             (
@@ -351,6 +368,7 @@ def update_targets(
     as_of: dt.date,
     financial_lookback_quarters: int,
     event_lookback_days: int,
+    daily_lookback_days: int = 7,
 ) -> list[tuple[str, dict[str, Any]]]:
     if spec.mode in {"statement", "period"}:
         all_periods = quarter_ends(archive_start, as_of)
@@ -373,6 +391,17 @@ def update_targets(
                 )
             )
         return targets
+
+    if spec.mode == "daily":
+        all_dates = calendar_dates(archive_start, as_of)
+        existing = set(manifest.get("partitions", {}))
+        missing = [trade_date for trade_date in all_dates if trade_date not in existing]
+        recent = all_dates[-daily_lookback_days:]
+        selected = sorted(set(missing) | set(recent))
+        return [
+            (trade_date, {"trade_date": trade_date})
+            for trade_date in selected
+        ]
 
     if spec.mode == "industry":
         return [
@@ -517,6 +546,16 @@ def _verify_partition_dates(
             )
         except BaseException as exc:
             errors.append(str(exc))
+    elif spec.mode == "daily":
+        frame = pd.read_parquet(path, columns=["trade_date"])
+        try:
+            validate_daily_frame(
+                frame,
+                query["trade_date"],
+                spec.name,
+            )
+        except BaseException as exc:
+            errors.append(str(exc))
     elif spec.mode == "industry":
         frame = pd.read_parquet(path, columns=["in_date", "out_date"])
         if not industry_overlap_mask(frame, query["start_date"], query["end_date"]).all():
@@ -648,6 +687,8 @@ def verify_dataset(
             expected_keys = set(quarter_ends(archive_start, archive_end))
         elif spec.mode == "event":
             expected_keys = {year for year, _start, _end in event_year_ranges(archive_start, archive_end)}
+        elif spec.mode == "daily":
+            expected_keys = set(calendar_dates(archive_start, archive_end))
         else:
             expected_keys = {"all"}
         missing_keys = expected_keys - set(partitions)

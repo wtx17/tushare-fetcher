@@ -24,6 +24,19 @@ from _models import (
 )
 
 
+def _strip_inline_markdown(value: str) -> str:
+    """Remove simple wrappers commonly used around Markdown table values."""
+    result = value.strip()
+    for marker in ("`", "**", "__", "*"):
+        if (
+            len(result) > 2 * len(marker)
+            and result.startswith(marker)
+            and result.endswith(marker)
+        ):
+            result = result[len(marker) : -len(marker)].strip()
+    return result
+
+
 def parse_output_fields(doc_path: Path) -> list[FieldSpec]:
     """Parse the first Markdown output-parameter table in a local API doc."""
     if not doc_path.is_file():
@@ -43,7 +56,7 @@ def parse_output_fields(doc_path: Path) -> list[FieldSpec]:
         if not active or not line.startswith("|"):
             continue
 
-        cells = [cell.strip().strip("`") for cell in line.strip("|").split("|")]
+        cells = [_strip_inline_markdown(cell) for cell in line.strip("|").split("|")]
         if len(cells) < 2:
             continue
         name, source_type = cells[0], cells[1]
@@ -186,6 +199,24 @@ def validate_event_frame(
         )
 
 
+def validate_daily_frame(
+    frame: pd.DataFrame,
+    trade_date: str,
+    dataset_name: str,
+) -> None:
+    if frame.empty:
+        return
+    values = frame["trade_date"].astype("string")
+    missing = values.isna()
+    invalid = missing | values.ne(trade_date)
+    if invalid.any():
+        examples = values.loc[invalid].drop_duplicates().head(5).tolist()
+        raise SourceSchemaError(
+            f"{dataset_name} trade_date={trade_date} returned other trade_date values: "
+            f"{examples}"
+        )
+
+
 def industry_overlap_mask(frame: pd.DataFrame, start_date: str, end_date: str) -> pd.Series:
     if frame.empty:
         return pd.Series([], index=frame.index, dtype="bool")
@@ -216,6 +247,7 @@ __all__ = [
     "validate_period_frame",
     "period_is_historical",
     "validate_event_frame",
+    "validate_daily_frame",
     "industry_overlap_mask",
     "load_all_fields",
 ]
