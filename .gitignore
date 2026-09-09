@@ -3,3 +3,6 @@ __pycache__/
 data/
 
 .DS_Store
+patch_reports/
+tests/
+industry_patch_backups/
