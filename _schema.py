@@ -166,8 +166,8 @@ def row_hashes(frame: pd.DataFrame) -> list[int]:
 def validate_period_frame(frame: pd.DataFrame, period: str, dataset_name: str) -> None:
     if frame.empty:
         return
-    values = frame["end_date"].dropna().astype("string")
-    invalid = values.ne(period)
+    values = frame["end_date"].astype("string")
+    invalid = values.isna() | values.ne(period)
     if invalid.any():
         examples = values.loc[invalid].drop_duplicates().head(5).tolist()
         raise SourceSchemaError(

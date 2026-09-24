@@ -1,19 +1,16 @@
-"""Atomic storage, manifests, partition orchestration and offline verification."""
+"""Manifests, partition orchestration and offline verification."""
 
 from __future__ import annotations
 
 import copy
-import dataclasses
 import datetime as dt
-import hashlib
-import json
-import os
 import uuid
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import pandas as pd
+import pyarrow as pa
 import pyarrow.dataset as pyarrow_dataset
 import pyarrow.parquet as pyarrow_parquet
 
@@ -27,17 +24,14 @@ from _fetch import (
 )
 from _models import (
     CATALOG_VERSION,
-    ConfigurationError,
     DatasetRunError,
     DatasetSpec,
     FieldSpec,
     LOGGER,
     MANIFEST_VERSION,
     OverwriteGuardError,
-    PartitionResult,
     SchemaDriftError,
     SourceSchemaError,
-    SyncError,
     calendar_dates,
     event_year_ranges,
     format_date,
@@ -53,65 +47,10 @@ from _schema import (
     validate_event_frame,
     validate_period_frame,
 )
-
-
-def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(chunk_size):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    try:
-        temporary.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-        os.replace(temporary, path)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
-
-
-def atomic_write_parquet(frame: pd.DataFrame, path: Path) -> tuple[str, int]:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    try:
-        frame.to_parquet(
-            temporary,
-            engine="pyarrow",
-            compression="zstd",
-            index=False,
-        )
-        metadata = pyarrow_parquet.read_metadata(temporary)
-        if metadata.num_rows != len(frame):
-            raise SyncError(
-                f"Parquet row-count mismatch for {path}: "
-                f"expected {len(frame)}, wrote {metadata.num_rows}"
-            )
-        checksum = sha256_file(temporary)
-        size = temporary.stat().st_size
-        os.replace(temporary, path)
-        return checksum, size
-    finally:
-        if temporary.exists():
-            temporary.unlink()
-
-
-def load_json(path: Path) -> dict[str, Any] | None:
-    if not path.is_file():
-        return None
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ConfigurationError(f"cannot read JSON file {path}: {exc}") from exc
-    if not isinstance(value, dict):
-        raise ConfigurationError(f"JSON root must be an object: {path}")
-    return value
+from _storage import (
+    archive_lock, atomic_write_json, atomic_write_parquet, commit_partition,
+    load_json, recover_transactions, sha256_file,
+)
 
 
 def dataset_root(output_dir: Path, spec: DatasetSpec) -> Path:
@@ -224,36 +163,6 @@ def partition_is_valid(
     return sha256_file(path) == manifest_entry.get("sha256")
 
 
-def build_partition_result(
-    output_dir: Path,
-    spec: DatasetSpec,
-    fields: Sequence[FieldSpec],
-    key: str,
-    query: dict[str, Any],
-    frame: pd.DataFrame,
-    stats: Mapping[str, Any],
-) -> PartitionResult:
-    target = partition_file(output_dir, spec, key)
-    checksum, size = atomic_write_parquet(frame, target)
-    relative = str(target.relative_to(output_dir))
-    return PartitionResult(
-        key=key,
-        relative_path=relative,
-        query=query,
-        rows=len(frame),
-        raw_rows=int(stats.get("raw_rows", len(frame))),
-        pages=int(stats.get("pages", 0)),
-        last_page_rows=int(stats.get("last_page_rows", 0)),
-        cross_page_duplicates=int(stats.get("cross_page_duplicates", 0)),
-        missing_fields=list(stats.get("missing_fields", [])),
-        warnings=list(stats.get("warnings", [])),
-        sha256=checksum,
-        bytes=size,
-        fetched_at=now_iso(),
-        subqueries=stats.get("subqueries"),
-    )
-
-
 def check_overwrite_safety(
     spec: DatasetSpec,
     key: str,
@@ -261,41 +170,33 @@ def check_overwrite_safety(
     old_entry: Mapping[str, Any] | None,
     allow_shrink: bool,
 ) -> None:
-    """Refuse to overwrite an existing partition with fewer rows.
+    """Permit corrections/de-duplication; reject empty or >50% unique-row loss.
 
-    For a fixed query the upstream row count only grows over time (late
-    filings, restatements add rows), so any shrink signals a likely throttle
-    or upstream regression rather than a legitimate change.  An empty fetch
-    over a previously non-empty partition is always refused, even with
-    ``allow_shrink``.
+    This is a throttle sanity check, not a proof of source completeness.
+    Callers pass the unique count of the SAME query window, not raw file size.
     """
-    if old_entry is None:
+    if old_entry is None or allow_shrink:
         return
     old_rows = int(old_entry.get("rows", 0))
-    new_rows = len(new_frame)
+    new_rows = len(new_frame.drop_duplicates())
     if new_rows == 0 and old_rows > 0:
         raise OverwriteGuardError(
             f"{spec.name} partition={key} new fetch returned 0 rows but existing "
-            f"partition has {old_rows}; refusing overwrite (use --force to refresh)"
+            f"query has {old_rows}; use --allow-shrink after reviewing the source"
         )
-    if not allow_shrink and new_rows < old_rows:
+    if new_rows < old_rows * 0.5:
         raise OverwriteGuardError(
-            f"{spec.name} partition={key} row count shrank {old_rows} -> {new_rows}; "
-            "refusing overwrite (use --allow-shrink or --force to override)"
+            f"{spec.name} partition={key} unique row count shrank {old_rows} -> {new_rows}; "
+            "refusing >50% loss (use --allow-shrink or --force to override)"
         )
 
 
 def _run_partition_task(
     fetcher: ApiFetcher,
-    output_dir: Path,
     spec: DatasetSpec,
     fields: Sequence[FieldSpec],
-    key: str,
     query: dict[str, Any],
-    old_entry: Mapping[str, Any] | None,
-    force: bool,
-    allow_shrink: bool,
-) -> PartitionResult:
+) -> tuple[pd.DataFrame, dict[str, Any]]:
     if spec.mode == "statement":
         frame, stats = fetch_statement_partition(fetcher, spec, fields, query["period"])
     elif spec.mode == "period":
@@ -325,13 +226,7 @@ def _run_partition_task(
         )
     else:
         raise AssertionError(f"unknown mode {spec.mode}")
-    # When refreshing an existing partition without --force, refuse to write a
-    # frame that is smaller than what is already stored.  The old file and
-    # manifest entry are left untouched because this function raises before
-    # build_partition_result performs any write.
-    if not force:
-        check_overwrite_safety(spec, key, frame, old_entry, allow_shrink)
-    return build_partition_result(output_dir, spec, fields, key, query, frame, stats)
+    return frame.drop_duplicates(ignore_index=True), stats
 
 
 def targets_for_range(
@@ -369,27 +264,27 @@ def update_targets(
     financial_lookback_quarters: int,
     event_lookback_days: int,
     daily_lookback_days: int = 7,
+    discovered_periods: Sequence[str] = (),
+    historical_periods: Sequence[str] = (),
+    refresh_recent: bool = True,
 ) -> list[tuple[str, dict[str, Any]]]:
     if spec.mode in {"statement", "period"}:
         all_periods = quarter_ends(archive_start, as_of)
         existing = set(manifest.get("partitions", {}))
         missing = [period for period in all_periods if period not in existing]
-        recent = all_periods[-financial_lookback_quarters:]
-        selected = sorted(set(missing) | set(recent))
+        recent = all_periods[-financial_lookback_quarters:] if refresh_recent else []
+        selected = sorted(set(missing) | set(recent) | set(discovered_periods) | set(historical_periods))
         return [(period, {"period": period}) for period in selected]
 
     if spec.mode == "event":
-        overlap_start = max(archive_start, as_of - dt.timedelta(days=event_lookback_days))
-        ranges = event_year_ranges(overlap_start, as_of)
+        overlap_start = update_window_start(manifest, archive_start, as_of, event_lookback_days)
         targets: list[tuple[str, dict[str, Any]]] = []
-        for year, _lower, upper in ranges:
-            year_start = max(archive_start, dt.date(int(year), 1, 1))
-            targets.append(
-                (
-                    year,
-                    {"start_date": format_date(year_start), "end_date": upper},
-                )
-            )
+        for year, lower, upper in event_year_ranges(archive_start, as_of):
+            old = manifest.get("partitions", {}).get(year)
+            if not old:
+                targets.append((year, {"start_date": lower, "end_date": upper}))
+            elif upper >= format_date(overlap_start):
+                targets.append((year, {"start_date": max(lower, format_date(overlap_start)), "end_date": upper}))
         return targets
 
     if spec.mode == "daily":
@@ -413,6 +308,82 @@ def update_targets(
     raise AssertionError(f"unknown mode {spec.mode}")
 
 
+def update_window_start(
+    manifest: Mapping[str, Any], archive_start: dt.date, as_of: dt.date, lookback_days: int,
+) -> dt.date:
+    state = manifest.get("update_state", {})
+    # Keep the original window on a failed first migration, even if some
+    # successful partition commits have already extended range_end.
+    pending_start = state.get("pending_window_start")
+    through = state.get("discovery_through") or manifest.get("range_end")
+    anchor = min(as_of, parse_yyyymmdd(through)) if through else as_of
+    start = max(archive_start, anchor - dt.timedelta(days=lookback_days - 1))
+    if pending_start:
+        start = min(start, parse_yyyymmdd(pending_start))
+    return start
+
+
+def historical_rotation(
+    manifest: Mapping[str, Any], archive_start: dt.date, as_of: dt.date,
+    recent_quarters: int, count: int,
+) -> list[str]:
+    all_periods = quarter_ends(archive_start, as_of)
+    eligible = all_periods[:-recent_quarters] if recent_quarters else all_periods
+    candidates = [p for p in eligible if p in manifest.get("partitions", {})]
+    cursor = manifest.get("update_state", {}).get("history_cursor", "")
+    ordered = [p for p in candidates if p > cursor] + [p for p in candidates if p <= cursor]
+    return ordered[:count]
+
+
+def _prepare_candidate(
+    output_dir: Path, spec: DatasetSpec, key: str, query: dict,
+    frame: pd.DataFrame, stats: dict, force: bool, allow_shrink: bool, run_id: str,
+) -> tuple[pd.DataFrame, dict, dict]:
+    target = partition_file(output_dir, spec, key)
+    old = pd.read_parquet(target) if target.exists() else None
+    stored_query = dict(query)
+    if spec.mode == "industry":
+        from patch_industry_data import PATCH_ID, audit_membership, patch_table
+        table = pa.Table.from_pandas(frame, preserve_index=False)
+        scope = {"range_start": query["start_date"], "range_end": query["end_date"]}
+        if spec.name == "index_member_all":
+            cleaned, report = patch_table(table, scope)
+            stats["industry_patch_id"] = PATCH_ID
+        else:
+            cleaned = table
+            report = {"action": "review_only", "audit": audit_membership(table, scope), "blockers": []}
+        report_path = output_dir / "_runs" / run_id / f"{spec.name}_audit.json"
+        atomic_write_json(report_path, report)
+        stats["industry_audit"] = str(report_path.relative_to(output_dir))
+        if report["blockers"]:
+            raise SourceSchemaError("industry patch requires review: " + "; ".join(report["blockers"]))
+        frame = cleaned.to_pandas().drop_duplicates(ignore_index=True)
+        audit = report.get("audit_after", report.get("audit", {}))
+        if audit.get("conflicts"):
+            stats.setdefault("warnings", []).append(f"industry audit: {len(audit['conflicts'])} unresolved conflicts; see {report_path}")
+        LOGGER.info("%s industry audit: %s", spec.name, report_path)
+    comparison = old
+    if old is not None and spec.mode == "event":
+        # Replace the complete fetched date window, including removals, while
+        # retaining every row outside it in the existing yearly partition.
+        mask = old["ann_date"].between(query["start_date"], query["end_date"]).fillna(False)
+        comparison = old.loc[mask]
+        manifest = load_json(manifest_path(output_dir, spec)) or {}
+        old_query = manifest.get("partitions", {}).get(key, {}).get("query", {})
+        stored_query = {
+            "start_date": min(query["start_date"], old_query.get("start_date", query["start_date"])),
+            "end_date": max(query["end_date"], old_query.get("end_date", query["end_date"])),
+        }
+        stats["refresh_window"] = dict(query)
+    if not force and comparison is not None:
+        check_overwrite_safety(spec, key, frame, {"rows": len(comparison.drop_duplicates())}, allow_shrink)
+    if old is not None and spec.mode == "event":
+        outside = old.loc[~mask]
+        if not outside.empty:
+            frame = pd.concat([outside, frame], ignore_index=True).drop_duplicates(ignore_index=True)
+    return frame, stored_query, stats
+
+
 def process_dataset(
     fetcher: ApiFetcher,
     output_dir: Path,
@@ -426,99 +397,75 @@ def process_dataset(
     force: bool,
     resume: bool,
     allow_shrink: bool = False,
+    run_id: str | None = None,
 ) -> dict[str, Any]:
+    run_id = run_id or uuid.uuid4().hex
     manifest = prepare_manifest(
-        output_dir,
-        spec,
-        fields,
-        docs_dir,
-        fetcher.api_url,
-        force=force,
-        requested_start=range_start,
-        requested_end=range_end,
+        output_dir, spec, fields, docs_dir, fetcher.api_url, force,
+        range_start, range_end,
     )
-    manifest.setdefault("partitions", {})
-    # Persist policy metadata even when every data partition is reused.  This
-    # keeps an older manifest auditable after an explicit proxy whitelist
-    # change without forcing an otherwise unnecessary historical redownload.
-    atomic_write_json(manifest_path(output_dir, spec), manifest)
     expected_hash = schema_hash(fields)
-
-    pending: list[tuple[str, dict[str, Any], Mapping[str, Any] | None]] = []
+    pending = []
     for key, query in targets:
-        existing_entry = manifest["partitions"].get(key)
-        if resume and not force and partition_is_valid(
-            output_dir,
-            existing_entry,
-            query,
-            expected_hash,
-        ):
+        entry = manifest["partitions"].get(key, {})
+        current_policy = entry.get("pagination_overlap_rows") == fetcher.page_overlap and entry.get("deduplicated")
+        if spec.mode == "industry":
+            current_policy = current_policy and bool(entry.get("industry_audit"))
+            if spec.name == "index_member_all":
+                from patch_industry_data import PATCH_ID
+                current_policy = current_policy and entry.get("industry_patch_id") == PATCH_ID
+        if resume and not force and current_policy and partition_is_valid(output_dir, entry, query, expected_hash):
             LOGGER.info("%s partition=%s already verified; skipping", spec.name, key)
             continue
-        pending.append((key, query, existing_entry))
+        pending.append((key, query))
 
-    if not pending:
-        LOGGER.info("%s has no pending partitions", spec.name)
-    failures: list[tuple[str, BaseException]] = []
-    completed = 0
-
-    # A statement partition already performs 12 sequential calls and retains
-    # wider frames in memory, so cap it slightly below the general worker count.
+    failures: list[tuple[str, Exception]] = []
     effective_workers = max(1, min(workers, len(pending) or 1))
     if spec.mode == "statement":
         effective_workers = min(effective_workers, 4)
-
+    # Workers only fetch. One writer commits backups, data and manifests in order.
     with ThreadPoolExecutor(max_workers=effective_workers) as executor:
-        future_map: dict[Future[PartitionResult], tuple[str, dict[str, Any]]] = {
-            executor.submit(
-                _run_partition_task,
-                fetcher,
-                output_dir,
-                spec,
-                fields,
-                key,
-                query,
-                old_entry,
-                force,
-                allow_shrink,
-            ): (key, query)
-            for key, query, old_entry in pending
+        futures = {
+            executor.submit(_run_partition_task, fetcher, spec, fields, query): (key, query)
+            for key, query in pending
         }
-        for future in as_completed(future_map):
-            key, _query = future_map[future]
+        for future in as_completed(futures):
+            key, query = futures[future]
             try:
-                result = future.result()
-            except BaseException as exc:
+                frame, stats = future.result()
+                frame, stored_query, stats = _prepare_candidate(
+                    output_dir, spec, key, query, frame, stats, force, allow_shrink, run_id,
+                )
+            except Exception as exc:
                 failures.append((key, exc))
                 LOGGER.error("%s partition=%s failed: %s", spec.name, key, exc)
                 continue
-
-            entry = result.to_manifest_entry()
-            entry["schema_hash"] = expected_hash
-            manifest["partitions"][result.key] = entry
-            old_start = manifest.get("range_start")
-            old_end = manifest.get("range_end")
-            manifest["range_start"] = min(filter(None, [old_start, range_start]))
-            manifest["range_end"] = max(filter(None, [old_end, range_end]))
-            manifest["updated_at"] = now_iso()
-            atomic_write_json(manifest_path(output_dir, spec), manifest)
-            completed += 1
-            LOGGER.info(
-                "%s partition=%s complete (%s/%s pending) rows=%s pages=%s bytes=%s",
-                spec.name,
-                result.key,
-                completed,
-                len(pending),
-                result.rows,
-                result.pages,
-                result.bytes,
+            entry = {
+                **stats, "relative_path": str(partition_file(output_dir, spec, key).relative_to(output_dir)),
+                "query": stored_query, "schema_hash": expected_hash, "fetched_at": now_iso(),
+                "pagination_overlap_rows": fetcher.page_overlap,
+            }
+            missing = entry.get("missing_fields", [])
+            if missing:
+                warning = "source omitted documented fields: " + ", ".join(sorted(missing))
+                entry["warnings"] = sorted(set(entry.get("warnings", [])) | {warning})
+            updated = copy.deepcopy(manifest)
+            updated["range_start"] = min(filter(None, [manifest.get("range_start"), range_start]))
+            updated["range_end"] = max(filter(None, [manifest.get("range_end"), range_end]))
+            updated["updated_at"] = now_iso()
+            # Commit errors must abort this dataset: a pending journal may need
+            # recovery before any later manifest write is safe.
+            manifest = commit_partition(
+                output_dir, partition_file(output_dir, spec, key), manifest_path(output_dir, spec),
+                updated, key, frame, entry, run_id,
             )
-
     if failures:
         detail = "; ".join(f"{key}: {exc}" for key, exc in failures[:10])
         raise DatasetRunError(
             f"{spec.name} failed {len(failures)} partition(s); successful partitions were kept. {detail}"
         )
+    if not pending:
+        atomic_write_json(manifest_path(output_dir, spec), manifest)
     return manifest
 
 
@@ -533,7 +480,7 @@ def _verify_partition_dates(
         frame = pd.read_parquet(path, columns=["end_date"])
         try:
             validate_period_frame(frame, query["period"], spec.name)
-        except BaseException as exc:
+        except Exception as exc:
             errors.append(str(exc))
     elif spec.mode == "event":
         frame = pd.read_parquet(path, columns=["ann_date"])
@@ -544,7 +491,7 @@ def _verify_partition_dates(
                 query["end_date"],
                 spec.name,
             )
-        except BaseException as exc:
+        except Exception as exc:
             errors.append(str(exc))
     elif spec.mode == "daily":
         frame = pd.read_parquet(path, columns=["trade_date"])
@@ -554,7 +501,7 @@ def _verify_partition_dates(
                 query["trade_date"],
                 spec.name,
             )
-        except BaseException as exc:
+        except Exception as exc:
             errors.append(str(exc))
     elif spec.mode == "industry":
         frame = pd.read_parquet(path, columns=["in_date", "out_date"])
@@ -647,14 +594,6 @@ def verify_dataset(
                 errors.append(
                     f"{spec.name} partition={key} missing-field warning is absent from manifest"
                 )
-        if missing and rows:
-            check = pd.read_parquet(parquet_path, columns=sorted(missing))
-            non_null = [name for name in check if check[name].notna().any()]
-            if non_null:
-                errors.append(
-                    f"{spec.name} partition={key} manifest-declared missing columns contain "
-                    f"values: {non_null}"
-                )
 
     dataset_dir = dataset_root(output_dir, spec)
     temporary_files = [
@@ -677,7 +616,7 @@ def verify_dataset(
             sample = pd.read_parquet(dataset_dir, columns=[expected_names[0]])
             if len(sample) != total_rows:
                 errors.append(f"{spec.name} pandas directory read returned the wrong row count")
-        except BaseException as exc:
+        except Exception as exc:
             errors.append(f"{spec.name} directory-level Parquet read failed: {exc}")
 
     if catalog and manifest.get("range_start") and manifest.get("range_end"):
@@ -744,11 +683,14 @@ __all__ = [
     "new_manifest",
     "prepare_manifest",
     "partition_is_valid",
-    "build_partition_result",
     "check_overwrite_safety",
     "targets_for_range",
     "update_targets",
     "process_dataset",
+    "update_window_start",
+    "historical_rotation",
+    "archive_lock",
+    "recover_transactions",
     "verify_dataset",
     "write_catalog",
 ]

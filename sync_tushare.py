@@ -2,7 +2,7 @@
 """Download the locally documented Tushare datasets to partitioned Parquet.
 
 The script deliberately keeps credentials outside the source tree.  Run it from
-the ``quant_data`` conda environment, where ``TUSHARE_TOKEN`` is configured.
+the ``qt`` conda environment, where ``TUSHARE_TOKEN`` is configured.
 
 This file is the command-line entry point and a re-export facade so that the
 historical ``import sync_tushare as sync`` surface keeps working; the real
@@ -17,8 +17,10 @@ import datetime as dt
 import logging
 import os
 import sys
+import uuid
+from zoneinfo import ZoneInfo
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Sequence
 from urllib.parse import urlparse
 
 # Facade re-export (keeps `import sync_tushare as sync; sync.X` working).
@@ -27,8 +29,8 @@ from _schema import *  # noqa: F401,F403
 from _fetch import *  # noqa: F401,F403
 from _pipeline import *  # noqa: F401,F403
 
-from _fetch import ApiFetcher
-from _models import API_ALIAS_TO_DATASET, ConfigurationError, DATASET_BY_NAME, DatasetSpec
+from _fetch import ApiFetcher, discover_financial_periods
+from _models import API_ALIAS_TO_DATASET, ConfigurationError, DATASET_BY_NAME, DatasetSpec, FINANCIAL_UPDATE_DATES
 from _pipeline import (
     process_dataset,
     targets_for_range,
@@ -81,7 +83,7 @@ def run_backfill(args: argparse.Namespace) -> int:
     fetcher = build_fetcher(args)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    failures: list[tuple[str, BaseException]] = []
+    failures: list[tuple[str, Exception]] = []
     for spec in selected:
         targets = targets_for_range(spec, start, end)
         LOGGER.info("starting %s with %s target partition(s)", spec.name, len(targets))
@@ -99,8 +101,9 @@ def run_backfill(args: argparse.Namespace) -> int:
                 force=args.force,
                 resume=True,
                 allow_shrink=args.allow_shrink,
+                run_id=getattr(args, "run_id", None),
             )
-        except BaseException as exc:
+        except Exception as exc:
             failures.append((spec.name, exc))
             LOGGER.error("dataset %s did not complete: %s", spec.name, exc)
 
@@ -116,67 +119,121 @@ def run_backfill(args: argparse.Namespace) -> int:
 def run_update(args: argparse.Namespace) -> int:
     catalog = load_json(catalog_path(args.output_dir))
     if not catalog:
-        raise ConfigurationError(
-            f"no catalog found at {catalog_path(args.output_dir)}; run backfill first"
-        )
+        raise ConfigurationError(f"no catalog found at {catalog_path(args.output_dir)}; run backfill first")
     archive_start = parse_yyyymmdd(catalog["archive_start"], "catalog archive_start")
     as_of = parse_yyyymmdd(args.as_of, "--as-of")
     if as_of < archive_start:
         raise ConfigurationError("--as-of precedes the stored archive start")
-
     selected = parse_api_selection(args.apis)
     fields_by_dataset = load_all_fields(args.docs_dir)
     fetcher = build_fetcher(args)
-    failures: list[tuple[str, BaseException]] = []
+    run_id = getattr(args, "run_id", None) or uuid.uuid4().hex
+    manifests, discovered, audits, windows = {}, {}, {}, {}
+    failures: list[tuple[str, Exception]] = []
+    failed = set()
+
+    # Discover all selected financial datasets first. Persist recipient work
+    # before any source advances its date cursor, so cross-dataset triggers
+    # survive a recipient failure or process interruption.
+    for spec in selected:
+        try:
+            manifest = prepare_manifest(
+                args.output_dir, spec, fields_by_dataset[spec.name], args.docs_dir,
+                fetcher.api_url, False, catalog["archive_start"], args.as_of,
+            )
+            manifests[spec.name] = manifest
+            state = manifest.get("update_state", {})
+            if state.get("discovery_through", "") > args.as_of:
+                raise ConfigurationError(f"{spec.name}: --as-of is before the successful date cursor")
+            if spec.name in FINANCIAL_UPDATE_DATES:
+                start = update_window_start(manifest, archive_start, as_of, args.announcement_lookback_days)
+                windows[spec.name] = format_date(start)
+                discovered[spec.name], audits[spec.name] = discover_financial_periods(
+                    fetcher, spec, fields_by_dataset[spec.name], start, as_of, archive_start,
+                )
+                atomic_write_json(args.output_dir / "_runs" / run_id / f"{spec.name}_discovery.json", audits[spec.name])
+            elif spec.mode == "event":
+                windows[spec.name] = format_date(update_window_start(manifest, archive_start, as_of, args.event_lookback_days))
+        except Exception as exc:
+            failures.append((spec.name, exc))
+            failed.add(spec.name)
+            LOGGER.error("%s discovery/preparation failed: %s", spec.name, exc)
+
+    owed = {name: set(manifest.get("update_state", {}).get("pending_periods", [])) | discovered.get(name, set())
+            for name, manifest in manifests.items() if name in FINANCIAL_UPDATE_DATES}
+    for source, recipients in {
+        "income": ("balancesheet", "fina_indicator"),
+        "cashflow": ("balancesheet", "fina_indicator"),
+        "balancesheet": ("fina_indicator",),
+    }.items():
+        for recipient in recipients:
+            if (recipient in {spec.name for spec in selected} and recipient not in manifests
+                    and discovered.get(source)):
+                raise DatasetRunError(
+                    f"cannot persist {source}'s pending quarters for {recipient}; "
+                    "repair its manifest/schema before advancing update dates"
+                )
+            if recipient in owed:
+                owed[recipient].update(discovered.get(source, set()))
+    # Keep pending triggers even for a recipient whose discovery failed today.
+    for spec in selected:
+        if spec.name not in manifests:
+            continue
+        manifest = manifests[spec.name]
+        state = manifest.setdefault("update_state", {})
+        if spec.name in owed:
+            state["pending_periods"] = sorted(owed[spec.name])
+        if spec.name in windows:
+            previous_start = state.get("pending_window_start", windows[spec.name])
+            state["pending_window_start"] = min(previous_start, windows[spec.name])
+        atomic_write_json(manifest_path(args.output_dir, spec), manifest)
 
     for spec in selected:
-        existing_manifest = load_json(manifest_path(args.output_dir, spec))
-        if existing_manifest is None:
-            existing_manifest = new_manifest(
-                spec,
-                fields_by_dataset[spec.name],
-                args.docs_dir,
-                fetcher.api_url,
-            )
+        if spec.name in failed:
+            continue
+        manifest = manifests[spec.name]
+        rotation = []
+        refresh_recent = True
+        if spec.name in FINANCIAL_UPDATE_DATES:
+            refresh_recent = spec.name == "balancesheet" or not manifest["update_state"].get("discovery_through")
+            rotation = historical_rotation(manifest, archive_start, as_of,
+                                           args.financial_lookback_quarters if refresh_recent else 0,
+                                           args.history_quarters_per_run)
         targets = update_targets(
-            spec,
-            existing_manifest,
-            archive_start,
-            as_of,
-            args.financial_lookback_quarters,
-            args.event_lookback_days,
-            args.daily_lookback_days,
+            spec, manifest, archive_start, as_of, args.financial_lookback_quarters,
+            args.event_lookback_days, args.daily_lookback_days,
+            discovered_periods=sorted(owed.get(spec.name, set())),
+            historical_periods=rotation, refresh_recent=refresh_recent,
         )
         LOGGER.info("updating %s with %s target partition(s)", spec.name, len(targets))
         try:
-            process_dataset(
-                fetcher=fetcher,
-                output_dir=args.output_dir,
-                docs_dir=args.docs_dir,
-                spec=spec,
-                fields=fields_by_dataset[spec.name],
-                targets=targets,
-                range_start=catalog["archive_start"],
-                range_end=args.as_of,
-                workers=args.workers,
-                force=False,
-                resume=False,
-                allow_shrink=args.allow_shrink,
+            manifest = process_dataset(
+                fetcher=fetcher, output_dir=args.output_dir, docs_dir=args.docs_dir,
+                spec=spec, fields=fields_by_dataset[spec.name], targets=targets,
+                range_start=catalog["archive_start"], range_end=args.as_of,
+                workers=args.workers, force=False, resume=False,
+                allow_shrink=args.allow_shrink, run_id=run_id,
             )
-        except BaseException as exc:
+            state = manifest.setdefault("update_state", {})
+            state["last_successful_as_of"] = args.as_of
+            if spec.name in FINANCIAL_UPDATE_DATES or spec.mode == "event":
+                state["discovery_through"] = args.as_of
+                state.pop("pending_window_start", None)
+            if spec.name in FINANCIAL_UPDATE_DATES:
+                state["pending_periods"] = []
+                state["last_discovery"] = audits[spec.name]
+                if rotation:
+                    state["history_cursor"] = rotation[-1]
+            manifest["updated_at"] = now_iso()
+            atomic_write_json(manifest_path(args.output_dir, spec), manifest)
+        except Exception as exc:
             failures.append((spec.name, exc))
             LOGGER.error("dataset %s update did not complete: %s", spec.name, exc)
 
     if failures:
         detail = "; ".join(f"{name}: {exc}" for name, exc in failures)
         raise DatasetRunError(f"update incomplete for {len(failures)} dataset(s). {detail}")
-    write_catalog(
-        args.output_dir,
-        catalog["archive_start"],
-        args.as_of,
-        selected,
-        "update",
-    )
+    write_catalog(args.output_dir, catalog["archive_start"], args.as_of, selected, "update")
     return 0
 
 
@@ -197,7 +254,7 @@ def run_smoke(args: argparse.Namespace) -> int:
     selected = parse_api_selection(args.apis)
     fields_by_dataset = load_all_fields(args.docs_dir)
     fetcher = build_fetcher(args)
-    failures: list[tuple[str, BaseException]] = []
+    failures: list[tuple[str, Exception]] = []
 
     for spec in selected:
         fields = fields_by_dataset[spec.name]
@@ -235,7 +292,7 @@ def run_smoke(args: argparse.Namespace) -> int:
                 overlap,
                 sorted(missing0 | missing1),
             )
-        except BaseException as exc:
+        except Exception as exc:
             failures.append((spec.name, exc))
             LOGGER.error("SMOKE %s failed: %s", spec.name, exc)
     if failures:
@@ -336,15 +393,19 @@ def build_parser() -> argparse.ArgumentParser:
     backfill.add_argument(
         "--allow-shrink",
         action="store_true",
-        help="permit overwriting an existing partition with fewer rows than stored",
+        help="permit empty responses or loss of more than half the unique rows",
     )
     backfill.set_defaults(handler=run_backfill)
 
     update = subparsers.add_parser("update", help="incrementally update an existing archive")
     add_common_options(update)
-    update.add_argument("--as-of", default=format_date(dt.date.today()))
+    update.add_argument("--as-of", default=format_date(dt.datetime.now(ZoneInfo("Asia/Shanghai")).date()))
     update.add_argument("--financial-lookback-quarters", type=int, default=8)
-    update.add_argument("--event-lookback-days", type=int, default=365)
+    update.add_argument("--announcement-lookback-days", type=int, default=7,
+                        help="financial publication-date overlap, including the successful cursor day")
+    update.add_argument("--event-lookback-days", type=int, default=7)
+    update.add_argument("--history-quarters-per-run", type=int, default=1,
+                        help="older quarters to rotate per financial dataset per run (0 disables)")
     update.add_argument(
         "--daily-lookback-days",
         type=int,
@@ -354,7 +415,7 @@ def build_parser() -> argparse.ArgumentParser:
     update.add_argument(
         "--allow-shrink",
         action="store_true",
-        help="permit overwriting an existing partition with fewer rows than stored",
+        help="permit empty responses or loss of more than half the unique rows",
     )
     update.set_defaults(handler=run_update)
 
@@ -394,6 +455,10 @@ def validate_cli_args(args: argparse.Namespace) -> None:
         raise ConfigurationError("--financial-lookback-quarters must be at least 1")
     if hasattr(args, "event_lookback_days") and args.event_lookback_days < 1:
         raise ConfigurationError("--event-lookback-days must be at least 1")
+    if hasattr(args, "announcement_lookback_days") and args.announcement_lookback_days < 1:
+        raise ConfigurationError("--announcement-lookback-days must be at least 1")
+    if hasattr(args, "history_quarters_per_run") and args.history_quarters_per_run < 0:
+        raise ConfigurationError("--history-quarters-per-run must not be negative")
     if hasattr(args, "daily_lookback_days") and args.daily_lookback_days < 1:
         raise ConfigurationError("--daily-lookback-days must be at least 1")
 
@@ -409,11 +474,31 @@ def main(argv: Sequence[str] | None = None) -> int:
         validate_cli_args(args)
         args.output_dir = args.output_dir.resolve()
         args.docs_dir = args.docs_dir.resolve()
+        if args.command in {"backfill", "update"}:
+            with archive_lock(args.output_dir):
+                args.run_id = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "_" + uuid.uuid4().hex[:8]
+                log_dir = args.output_dir / "_runs" / args.run_id
+                log_dir.mkdir(parents=True)
+                handler = logging.FileHandler(log_dir / "run.log", encoding="utf-8")
+                handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+                LOGGER.addHandler(handler)
+                try:
+                    LOGGER.info("starting %s run=%s", args.command, args.run_id)
+                    recover_transactions(args.output_dir)
+                    result = int(args.handler(args))
+                    LOGGER.info("%s complete", args.command)
+                    return result
+                except Exception:
+                    LOGGER.exception("%s failed; retained backups and pending work", args.command)
+                    raise
+                finally:
+                    LOGGER.removeHandler(handler)
+                    handler.close()
         return int(args.handler(args))
     except KeyboardInterrupt:
         LOGGER.error("interrupted; completed partitions remain resumable")
         return 130
-    except SyncError as exc:
+    except (SyncError, OSError) as exc:
         LOGGER.error("%s", exc)
         return 1
 

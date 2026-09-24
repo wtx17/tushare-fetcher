@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import datetime as dt
 import random
 import threading
 import time
@@ -17,8 +18,13 @@ from _models import (
     FetchResult,
     FieldSpec,
     LOGGER,
+    PAGE_OVERLAP,
+    FINANCIAL_UPDATE_DATES,
     SourceSchemaError,
     SyncError,
+    calendar_dates,
+    format_date,
+    parse_yyyymmdd,
 )
 from _schema import (
     empty_frame,
@@ -72,6 +78,7 @@ class ApiFetcher:
         max_retries: int = 5,
         request_interval: float = 0.1,
         query_override: Callable[[str, str, Mapping[str, Any]], pd.DataFrame] | None = None,
+        page_overlap: int = PAGE_OVERLAP,
     ) -> None:
         if not token and query_override is None:
             raise ConfigurationError("TUSHARE_TOKEN is not set in the active environment")
@@ -82,6 +89,7 @@ class ApiFetcher:
         self.rate_limiter = RateLimiter(request_interval)
         self._local = threading.local()
         self._query_override = query_override
+        self.page_overlap = page_overlap
 
     def _client(self) -> Any:
         client = getattr(self._local, "client", None)
@@ -116,7 +124,7 @@ class ApiFetcher:
                 return result
             except SourceSchemaError:
                 raise
-            except BaseException as exc:
+            except Exception as exc:
                 if self._is_non_retryable(exc) or attempt >= self.max_retries:
                     raise SyncError(f"{api_name} request failed: {exc}") from exc
                 delay = min(30.0, (2 ** (attempt - 1)) + random.random())
@@ -137,13 +145,13 @@ class ApiFetcher:
         fields: Sequence[FieldSpec],
         base_params: Mapping[str, Any],
     ) -> FetchResult:
+        if not 0 <= self.page_overlap < spec.page_size:
+            raise ConfigurationError("pagination overlap must be >= 0 and less than page size")
         fields_csv = ",".join(field.name for field in fields)
         page_frames: list[pd.DataFrame] = []
-        seen_hashes: set[int] = set()
         seen_page_fingerprints: set[str] = set()
         missing_fields: set[str] = set()
         warnings: list[str] = []
-        cross_page_duplicates = 0
         raw_rows = 0
         pages = 0
         last_page_rows = 0
@@ -182,34 +190,28 @@ class ApiFetcher:
             if hashes:
                 seen_page_fingerprints.add(fingerprint)
 
-            # Compare against rows from prior pages only.  Identical rows that
-            # coexist in one upstream page remain intact as raw source data.
-            keep = [value not in seen_hashes for value in hashes]
-            overlap = len(keep) - sum(keep)
-            if overlap:
-                cross_page_duplicates += overlap
-                normalized = normalized.loc[keep].reset_index(drop=True)
-            seen_hashes.update(hashes)
-            page_frames.append(normalized)
+            page_frames.append(normalized.drop_duplicates(ignore_index=True))
 
             if page_rows < spec.page_size:
                 break
-            offset += page_rows
+            # Offset belongs to the raw server result, never to deduplicated rows.
+            offset += spec.page_size - self.page_overlap
 
-        if cross_page_duplicates:
+        frame = pd.concat(page_frames, ignore_index=True) if page_frames else empty_frame(fields)
+        unique_page_rows = len(frame)
+        frame = frame.drop_duplicates(ignore_index=True)
+        cross_page_duplicates = unique_page_rows - len(frame)
+        duplicates_removed = raw_rows - len(frame)
+        if duplicates_removed:
             warnings.append(
-                f"removed {cross_page_duplicates} exact row overlaps across pagination pages"
+                f"removed {duplicates_removed} exact duplicate rows "
+                f"({cross_page_duplicates} across pagination pages)"
             )
         if missing_fields:
             warnings.append(
                 "source omitted documented fields: " + ", ".join(sorted(missing_fields))
             )
 
-        frame = (
-            pd.concat(page_frames, ignore_index=True)
-            if page_frames
-            else empty_frame(fields)
-        )
         if frame.empty:
             frame = empty_frame(fields)
         return FetchResult(
@@ -220,7 +222,63 @@ class ApiFetcher:
             cross_page_duplicates=cross_page_duplicates,
             missing_fields=missing_fields,
             warnings=warnings,
+            duplicates_removed=duplicates_removed,
         )
+
+
+def discover_financial_periods(
+    fetcher: ApiFetcher,
+    spec: DatasetSpec,
+    fields: Sequence[FieldSpec],
+    start: dt.date,
+    end: dt.date,
+    archive_start: dt.date,
+) -> tuple[set[str], dict[str, Any]]:
+    """Discover report periods by a validated exact publication-date predicate.
+
+    Do not combine this with period or start_date/end_date: the proxy's period
+    predicate overrides ranges, and its ranges use ann_date even for income.
+    """
+    date_field = FINANCIAL_UPDATE_DATES[spec.name]
+    names = {"ts_code", "end_date", date_field}
+    if spec.mode == "statement":
+        names.add("report_type")
+    projection = [field for field in fields if field.name in names]
+    if {field.name for field in projection} != names:
+        raise ConfigurationError(f"{spec.name} lacks discovery fields {names}")
+    periods: set[str] = set()
+    pages = raw_rows = 0
+    for day in calendar_dates(start, end):
+        report_types = [str(value) for value in range(1, 13)] if spec.mode == "statement" else [None]
+        for report_type in report_types:
+            params = {date_field: day}
+            if report_type is not None:
+                params["report_type"] = report_type
+            result = fetcher.fetch_paginated(spec, projection, params)
+            frame = result.frame
+            pages += result.pages
+            raw_rows += result.raw_rows
+            if frame.empty:
+                continue
+            if not frame[date_field].eq(day).fillna(False).all():
+                raise SourceSchemaError(f"{spec.name} ignored {date_field}={day}; discovery aborted")
+            if report_type is not None and not frame["report_type"].eq(report_type).fillna(False).all():
+                raise SourceSchemaError(f"{spec.name} ignored report_type={report_type}")
+            for period in frame["end_date"].unique():
+                try:
+                    parsed = parse_yyyymmdd(period, "discovered end_date")
+                except ConfigurationError as exc:
+                    raise SourceSchemaError(f"{spec.name}: {exc}") from exc
+                if parsed >= archive_start:
+                    periods.add(period)
+    audit = {
+        "date_field": date_field, "start_date": format_date(start),
+        "end_date": format_date(end), "pages": pages, "raw_rows": raw_rows,
+        "periods": sorted(periods),
+    }
+    LOGGER.info("%s discovery %s=%s..%s periods=%s", spec.name, date_field,
+                audit["start_date"], audit["end_date"], audit["periods"])
+    return periods, audit
 
 
 def fetch_period_partition(
@@ -241,6 +299,7 @@ def fetch_period_partition(
         "pages": result.pages,
         "last_page_rows": result.last_page_rows,
         "cross_page_duplicates": result.cross_page_duplicates,
+        "duplicates_removed": result.duplicates_removed,
         "missing_fields": sorted(result.missing_fields),
         "warnings": result.warnings,
     }
@@ -277,7 +336,7 @@ def fetch_statement_partition(
             )
         if not result.frame.empty:
             returned_types = set(result.frame["report_type"].dropna().astype("string").tolist())
-            if returned_types - {key}:
+            if result.frame["report_type"].isna().any() or returned_types - {key}:
                 raise SourceSchemaError(
                     f"{spec.name} period={period} report_type={key} returned types "
                     f"{sorted(returned_types)}"
@@ -295,6 +354,7 @@ def fetch_statement_partition(
             "pages": result.pages,
             "last_page_rows": result.last_page_rows,
             "cross_page_duplicates": result.cross_page_duplicates,
+            "duplicates_removed": result.duplicates_removed,
             "missing_fields": sorted(result.missing_fields),
             "warnings": result.warnings,
         }
@@ -315,6 +375,7 @@ def fetch_statement_partition(
         "pages": total_pages,
         "last_page_rows": last_page_rows,
         "cross_page_duplicates": total_cross_page_duplicates,
+        "duplicates_removed": sum(item["duplicates_removed"] for item in subqueries.values()),
         "missing_fields": sorted(all_missing),
         "warnings": sorted(set(warnings)),
         "subqueries": subqueries,
@@ -340,6 +401,7 @@ def fetch_event_partition(
         "pages": result.pages,
         "last_page_rows": result.last_page_rows,
         "cross_page_duplicates": result.cross_page_duplicates,
+        "duplicates_removed": result.duplicates_removed,
         "missing_fields": sorted(result.missing_fields),
         "warnings": result.warnings,
     }
@@ -365,6 +427,7 @@ def fetch_daily_partition(
         "pages": result.pages,
         "last_page_rows": result.last_page_rows,
         "cross_page_duplicates": result.cross_page_duplicates,
+        "duplicates_removed": result.duplicates_removed,
         "missing_fields": sorted(result.missing_fields),
         "warnings": result.warnings,
     }
@@ -391,7 +454,7 @@ def fetch_industry_partition(
         result = fetcher.fetch_paginated(spec, fields, {"is_new": is_new})
         if not result.frame.empty:
             returned = set(result.frame["is_new"].dropna().astype("string").tolist())
-            if returned - {is_new}:
+            if result.frame["is_new"].isna().any() or returned - {is_new}:
                 raise SourceSchemaError(
                     f"{spec.name} is_new={is_new} returned status values {sorted(returned)}"
                 )
@@ -408,6 +471,7 @@ def fetch_industry_partition(
             "pages": result.pages,
             "last_page_rows": result.last_page_rows,
             "cross_page_duplicates": result.cross_page_duplicates,
+            "duplicates_removed": result.duplicates_removed,
             "missing_fields": sorted(result.missing_fields),
             "warnings": result.warnings,
         }
@@ -427,6 +491,7 @@ def fetch_industry_partition(
         "pages": total_pages,
         "last_page_rows": last_page_rows,
         "cross_page_duplicates": total_cross_page_duplicates,
+        "duplicates_removed": sum(item["duplicates_removed"] for item in subqueries.values()),
         "missing_fields": sorted(all_missing),
         "warnings": sorted(set(warnings)),
         "subqueries": subqueries,
@@ -440,6 +505,7 @@ __all__ = [
     "NON_RETRYABLE_MESSAGE_PARTS",
     "RateLimiter",
     "ApiFetcher",
+    "discover_financial_periods",
     "fetch_period_partition",
     "fetch_statement_partition",
     "fetch_event_partition",

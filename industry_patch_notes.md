@@ -15,7 +15,7 @@
 | 000956.SZ | 中原油气(退市) | 19991110 | 传媒 / 数字媒体 / 视频媒体 |
 
 三条的代码路径均为 `801760.SI / 801767.SI / 857671.SI`，
-`is_new=Y`、`out_date=NULL`。脚本会同时要求每只股票恰好存在一条应保留记录：
+`is_new=Y`、`out_date=NULL`（匹配时也接受表示开放区间的空字符串）。脚本会同时要求每只股票恰好存在一条应保留记录：
 相同股票、名称、in_date、is_new 和空 out_date，行业路径为
 `801960.SI / 801961.SI / 859611.SI`（石油石化 / 油气开采Ⅱ / 油气开采Ⅲ）。
 
@@ -113,8 +113,8 @@ python patch_industry_data.py --data-dir /path/to/tushare-fetcher/data \
 python patch_industry_data.py --data-dir /path/to/tushare-fetcher/data --apply
 ```
 
-应用前暂停该目录的下载任务和读取进程。脚本的文件锁仅协调本补丁进程，
-原抓取器不使用这把锁。程序会先校验输入与生成候选，保存完整备份，再替换文件。
+独立脚本与抓取器共用归档根目录的 `.sync.lock`，防止并发写入。若发现抓取器有未完成的
+提交日志，先重跑抓取命令完成恢复，再运行独立补丁。程序会先校验输入与生成候选，保存完整备份，再替换文件。
 默认备份父目录为数据目录同级的 `industry_patch_backups`，也可用
 `--backup-dir /path/to/backups` 指定，必须位于数据目录外。
 
@@ -196,3 +196,10 @@ IndustryPanel(shape=(168, 3611), n_industries=31, coverage=0.9778)
 完整指标与缺失明细在 `patch_reports/20260909/loader_after_patch.json`，
 解码后的面板在同目录 `industry_l1_after_patch.parquet`，
 执行计划和完成记录在 `local_run_plan.md`，正式应用审计在 `apply_local.json`。
+
+## 抓取时自动应用
+
+`sync_tushare.py backfill/update` 在申万候选数据发布前调用同一套已审查规则，先整行去重，
+再应用补丁、检查未知冲突。中信仅审计，不应用申万修正。行业审计报告位于
+`data/_runs/<运行 ID>/`；发生历史文件变化时，原 Parquet、原 manifest 和完整新增/移除行
+由抓取器保存在 `data/_history/`，详情见 README。独立脚本的预览、应用和恢复命令仍可使用。

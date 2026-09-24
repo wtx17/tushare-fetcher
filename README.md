@@ -1,85 +1,125 @@
 # tushare-sync
 
-从 Tushare API 拉取财务、股东、行业分类、每日指标等 A 股数据，本地存储为分区 Parquet 文件。
+从 Tushare API 拉取财务、股东、行业分类、每日指标等 A 股数据，存储为分区 Parquet。
 
-## 环境准备
-
-```bash
-# 使用 quant_data conda 环境
-conda activate quant_data
-
-# 设置 Tushare Token
-export TUSHARE_TOKEN="你的token"
-```
-
-## 快速上手
+## 环境与命令
 
 ```bash
-# 首次全量回填（2016~至今）
-python sync_tushare.py backfill --start-date 20160720 --end-date 20260720
+conda activate qt  # 使用该环境配置的 TUSHARE_TOKEN
 
-# 后续增量更新
-python sync_tushare.py update --as-of 20260720
+# 全量回填；已有旧版分区会重新按 200 行重叠分页抓取
+python sync_tushare.py backfill --start-date 20160720 --end-date 20260925
 
-# 离线校验本地数据完整性
+# 每日更新，默认截至上海时区当天；也可以显式指定 --as-of YYYYMMDD
+python sync_tushare.py update
+
+# 离线检查本地文件、schema、日期、行数和校验和
 python sync_tushare.py verify
-
-# 快速连通性测试
-python sync_tushare.py smoke
 ```
+
+`update` 需要已有成功回填生成的 `_catalog.json`。命令适合被外部调度器每天调用；本项目不自动安装定时任务。
+同一归档只允许一个写入进程，抓取器和独立行业补丁共用 `.sync.lock`。
+
+## 全量回填与分页
+
+- 财务数据按 `end_date` 季度分区，三张报表逐一查询 `report_type=1..12`；股东数据按公告年份分区；每日指标按日期分区。
+- 所有正式分页请求使用 **200 行重叠**：一页原始返回数量等于 `limit` 时，下一页 `offset += limit - 200`；原始返回少于 `limit` 才结束。
+- 按文档列规范化类型后，对**全部字段完全相同的行**去重，包括页内和页间重复。数值或日期不同的版本均保留。
+- 完整页重复、字段错误、日期条件被忽略等情况会报错。不会根据“本页去重后没有新增行”判断取完。
+- 分区逐个提交，中途失败保留已完成分区。重新执行 `backfill` 跳过校验通过且已记录新分页策略的分区；`--force` 可强制重抓。
+
+## 每日更新策略
+
+| 数据集 | 发现变化的字段 | 写入方式 |
+| --- | --- | --- |
+| `income`、`cashflow` | 逐日精确查询 `f_ann_date`，发现阶段不传 `period` | 收集 `end_date`，完整重抓并替换受影响季度的全部 12 类报表 |
+| `balancesheet` | 逐日精确查询 `ann_date` | 完整替换受影响季度，并在每次更新时刷新最近 8 个季度 |
+| `fina_indicator`、`forecast`、`express` | 逐日精确查询 `ann_date` | 完整替换受影响季度 |
+| `stk_holdernumber`、`stk_holdertrade` | `ann_date` 起止日期窗口 | 替换窗口内所有记录，保留对应 `ann_year` 文件中窗口外的记录；缺失年份完整补齐 |
+| `index_member_all` | 每次全量查询 `is_new=Y/N`，保留与归档时间相交的关系 | 去重、应用已审查申万补丁、审计后替换，并记录与旧文件的差异 |
+| `ci_index_member` | 同上 | 去重、审计后替换；未知行业问题写入审计报告，不套用申万补丁 |
+| `daily_basic` | 逐日 `trade_date` | 补齐缺失日期，完整替换最近 7 个自然日；非交易日可存空分区 |
+
+当前代理忽略资产负债表的 `f_ann_date` 过滤，因此不能直接复制利润表的查询策略。
+利润表/现金流发现的季度还会触发本次所选的资产负债表和财务指标更新，资产负债表也会触发财务指标更新。
+这些待刷新季度会先落盘，即使接收方失败、发送方已推进日期，下次仍会重试。
+
+使用完整季度替换是为了处理旧版本被移到其他 `report_type`、旧行被删除或修订的情况。
+不按业务主键保留单个“最新版本”，也不把抓到的行直接追加到旧文件。
+
+### 日期进度与历史轮巡
+
+- 财务和股东接口各自维护 `update_state.discovery_through`，表示成功查询并完成对应写入的日期。
+- 默认从上次成功日期向前重叠 7 个自然日（含该日），一直查询到本次 `--as-of`。停跑数日后会补查整个缺口，进度不取自数据行的最大日期。
+- 任一相关分区失败，该数据集的日期进度不推进；成功写入的其他分区保留。待刷新季度、未完成日期窗口均持久保存。
+- 所有财务数据集每次额外轮巡 1 个已存季度，循环覆盖没有自动近期刷新覆盖的季度，以逐步发现未改变公告日期的历史修订。
+- 首次更新旧版归档时，用 manifest 的 `range_end` 作为日期起点，并额外刷新最近 8 个季度。此前的更早修订依靠轮巡或主动重抓历史范围。
+- 新发现的报表期可以早于最近季度，也可以是尚未结束的预测报告期；只要不早于归档起点，就会刷新对应分区。
+
+## 历史备份与差异日志
+
+只要已有分区的行集合、重复数量或 schema 发生变化，**先保存原文件，再发布候选文件**。当前年份、最近日期的已有分区也执行相同保护。
+
+```text
+data/
+├── _catalog.json
+├── _runs/<运行 ID>/
+│   ├── run.log                          # 运行、错误及每次改写的统计与日志路径
+│   ├── income_discovery.json            # 日期发现窗口和命中季度
+│   └── index_member_all_audit.json      # 行业补丁及审计明细
+├── _history/<运行 ID>/<数据集>/<分区>/<变更 ID>/
+│   ├── before.parquet                   # 原数据文件的逐字节备份
+│   ├── before_manifest.json             # 提交前的原 manifest
+│   ├── added.parquet                    # 新文件独有的完整行
+│   ├── removed.parquet                  # 原文件独有的完整行
+│   └── change.json                      # 行数、重复数、schema、校验和、示例、提交状态
+├── _transactions/                      # 未完成提交的候选文件与恢复日志
+├── income/period/20260331/data.parquet
+├── stk_holdernumber/ann_year/2026/data.parquet
+├── daily_basic/trade_date/20260925/data.parquet
+└── index_member_all/data.parquet
+```
+
+各数据集仍有 `_manifest.json`，分区条目中的 `last_change` 指向最新变更日志。
+备份和差异目录位于数据集目录之外，`pd.read_parquet("data/income")` 不会混入备份。
+
+- 一行数值变化会表现为一条移除、一条新增；不假设 `(ts_code, end_date)` 是唯一键。
+- 仅顺序变化时保留原 Parquet 字节，只更新检查元信息；不新增备份。
+- 原文件有重复行而新文件仅去重时，新增/移除行数均可为 0，`old_duplicate_rows` 会记录去掉的重复数量。
+- 备份、差异或候选文件写入失败，原数据文件不替换。数据和 manifest 之间发生进程中断，下次修改命令会先按 `_transactions` 日志完成提交；发现外部修改时拒绝覆盖。
+- 备份不自动清理。恢复单个历史分区需同时核对 manifest；不要把某个旧的整份 manifest 直接覆盖回去，以免撤销其他分区的后续进度。
 
 ## 常用参数
 
 | 参数 | 说明 |
-|---|---|
-| `--apis fina_indicator,income` | 只同步指定数据集（默认 `all`） |
-| `--output-dir ./data` | 输出目录 |
-| `--workers 1` | 并发拉取数 （api限制，默认为1，不能并发）|
-| `--daily-lookback-days 7` | 增量更新时重新拉取最近若干个自然日的每日指标 |
-| `--force` | 强制重新下载已校验的分区 |
-| `--allow-shrink` | 允许新数据行数少于旧数据 |
-| `--log-level DEBUG` | 调试日志 |
+| --- | --- |
+| `--apis fina_indicator,income` | 只处理指定数据集，默认 `all`；关联触发仅限本次所选数据集 |
+| `--output-dir ./data` | 归档目录 |
+| `--workers 1` | 当前第三方代理必须为 1，避免并发下的空响应 |
+| `--announcement-lookback-days 7` | 财务公告日期重叠天数 |
+| `--event-lookback-days 7` | 股东公告日期重叠天数 |
+| `--daily-lookback-days 7` | 每日指标重新抓取的最近自然日数 |
+| `--financial-lookback-quarters 8` | 资产负债表每次、其余财务数据首次迁移时刷新的近期季度数 |
+| `--history-quarters-per-run 1` | 每个财务数据集每次轮巡季度数，0 关闭 |
+| `backfill --force` | 重抓目标分区，仍保存备份和差异 |
+| `--allow-shrink` | 经核实后允许已有查询窗口变空或唯一行数减少超过 50% |
+| `--log-level DEBUG` | 放在子命令之前，输出调试日志 |
 
-## 支持的数据集
+默认接受一般修订造成的减少；已有查询窗口变空、唯一行数减少超过 50% 时拒绝覆盖，避免明显截断。
+`--allow-shrink` 和 `--force` 只绕过此行数保护，不绕过日期、schema、行业补丁核验，以及财务指标/报表主类型历史空响应检查。
 
-| 名称 | 说明 |
-|---|---|
-| `fina_indicator` | 财务指标（EPS、ROE 等） |
-| `forecast` | 业绩预告 |
-| `express` | 业绩快报 |
-| `income` | 利润表 |
-| `balancesheet` | 资产负债表 |
-| `cashflow` | 现金流量表 |
-| `stk_holdernumber` | 股东人数变化 |
-| `stk_holdertrade` | 股东增减持 |
-| `index_member_all` | 申万行业成分 |
-| `ci_index_member` | 中信行业成分 |
-| `daily_basic` | 每日指标（按交易日期逐日请求全市场） |
+## 一致性边界
 
-## 本地数据结构
+200 行重叠是基于当前实验的工程选择，不能证明服务端稳定排序或一致快照。
+本地保存的是规范化后的整行集合；行业数据再施加已审查补丁。申万未知冲突会阻止发布，中信问题保留并记录。
+财务轮巡能逐步发现历史变化；股东/每日指标在重查窗口之外发生的修订，需要扩大窗口或主动回填。
+`verify` 验证本地归档，不能证明远端无漏行。未改变日期的晚入库数据、超过重叠宽度的排序变化等情况仍可能遗漏。
 
-```
-data/
-├── _catalog.json              # 归档元信息
-├── fina_indicator/
-│   ├── _manifest.json
-│   └── period/20260331/data.parquet
-├── stk_holdernumber/
-│   ├── _manifest.json
-│   └── ann_year/2026/data.parquet
-├── daily_basic/
-│   ├── _manifest.json
-│   └── trade_date/20260720/data.parquet
-└── index_member_all/
-    ├── _manifest.json
-    └── data.parquet
+## 测试
+
+```bash
+conda activate qt
+python -m pytest -q
 ```
 
-## 设计要点
-
-- **Schema 来自文档**：字段定义从 `使用说明/` 目录的 Markdown 解析，与 Tushare API 文档同步。
-  - 只有写在 `_models.py` 中的数据集会被解析
-- **崩溃可恢复**：每个分区完成后原子更新 manifest，中断后重跑会自动跳过已完成分区。
-- **每日指标逐日拉取**：`daily_basic` 每次只查询一个 `trade_date`，按自然日独立分区；非交易日的空分区用于记录该日已完成查询。当前第三方端口缺少的 `limit_status` 会补为可空整数。
-- **防误覆盖**：拒绝用更少行数的分区覆盖已有数据（常见于 API 限流），除非加 `--force`。
-- **离线校验**：`verify` 命令检查校验和、行数、schema、日期约束，无需网络。
+测试使用模拟 API 和临时归档，覆盖分页、日期过滤、季度版本迁移、更新进度、备份差异、提交恢复和行业补丁。

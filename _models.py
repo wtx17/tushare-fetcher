@@ -23,6 +23,18 @@ DEFAULT_API_URL = "https://tx.xiaodefa.top/"
 DATE_FORMAT = "%Y%m%d"
 MANIFEST_VERSION = 1
 CATALOG_VERSION = 1
+PAGE_OVERLAP = 200
+
+# The proxy ignores f_ann_date on balancesheet_vip. Never infer this capability
+# merely from the presence of an output column.
+FINANCIAL_UPDATE_DATES = {
+    "fina_indicator": "ann_date",
+    "forecast": "ann_date",
+    "express": "ann_date",
+    "income": "f_ann_date",
+    "balancesheet": "ann_date",
+    "cashflow": "f_ann_date",
+}
 
 KNOWN_INCOME_MISSING_FIELDS = frozenset(
     {
@@ -121,6 +133,7 @@ class FetchResult:
     cross_page_duplicates: int
     missing_fields: set[str]
     warnings: list[str]
+    duplicates_removed: int = 0
 
 
 @dataclasses.dataclass
@@ -254,6 +267,8 @@ __all__ = [
     "DATE_FORMAT",
     "MANIFEST_VERSION",
     "CATALOG_VERSION",
+    "PAGE_OVERLAP",
+    "FINANCIAL_UPDATE_DATES",
     "KNOWN_INCOME_MISSING_FIELDS",
     "KNOWN_EXPRESS_MISSING_FIELDS",
     "KNOWN_DAILY_BASIC_MISSING_FIELDS",

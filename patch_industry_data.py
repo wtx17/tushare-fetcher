@@ -195,14 +195,18 @@ def case_row(case: tuple[str, str, str], industry: tuple[str, ...]) -> dict:
     return dict(zip(COLUMNS, (*industry, code, name, start, None, "Y")))
 
 
-def plan_patch(snapshot: Snapshot) -> tuple[pa.Table, dict]:
-    rows = snapshot.table.to_pylist()
+def patch_table(table: pa.Table, manifest: dict) -> tuple[pa.Table, dict]:
+    """Apply only reviewed SW cases to a candidate, without publishing files."""
+    rows = table.to_pylist()
+    # The endpoint uses both null and empty text for an open interval. Keep
+    # source values intact; treat these as equivalent only for case matching.
+    match_rows = [{**row, "out_date": row["out_date"] or None} for row in rows]
     remove, cases, blockers = [], [], []
     for case in REVIEWED_CASES:
         bad, good = case_row(case, WRONG_PATH), case_row(case, RETAIN_PATH)
-        bad_positions = [i for i, row in enumerate(rows) if row == bad]
-        good_positions = [i for i, row in enumerate(rows) if row == good]
-        context = [row for row in rows if row["ts_code"] == case[0]]
+        bad_positions = [i for i, row in enumerate(match_rows) if row == bad]
+        good_positions = [i for i, row in enumerate(match_rows) if row == good]
+        context = [row for row in match_rows if row["ts_code"] == case[0]]
         if not context:
             status = "not_present"
         elif len(good_positions) != 1 or len(bad_positions) > 1 or len(context) != 1 + len(bad_positions):
@@ -216,18 +220,23 @@ def plan_patch(snapshot: Snapshot) -> tuple[pa.Table, dict]:
         cases.append({"ts_code": case[0], "status": status, "remove": bad, "retain": good,
                       "observed_rows": context})
     removed = set(remove)
-    cleaned = snapshot.table.take(pa.array([i for i in range(len(rows)) if i not in removed], type=pa.int64()))
-    after = audit_membership(cleaned, snapshot.manifest)
+    cleaned = table.take(pa.array([i for i in range(len(rows)) if i not in removed], type=pa.int64()))
+    after = audit_membership(cleaned, manifest)
     if after["conflicts"]:
         blockers.append("Unresolved equal-precedence conflicts remain; add reviewed cases before applying")
     report = {
-        "patch_id": PATCH_ID, "action": "preview", "data_dir": str(snapshot.root),
-        "input_sha256": snapshot.hashes, "cases": cases,
+        "patch_id": PATCH_ID, "action": "preview", "cases": cases,
         "rows_before": len(rows), "rows_after": cleaned.num_rows,
         "removed_rows": [rows[i] for i in sorted(removed)],
-        "audit_before": audit_membership(snapshot.table, snapshot.manifest), "audit_after": after,
+        "audit_before": audit_membership(table, manifest), "audit_after": after,
         "blockers": blockers,
     }
+    return cleaned, report
+
+
+def plan_patch(snapshot: Snapshot) -> tuple[pa.Table, dict]:
+    cleaned, report = patch_table(snapshot.table, snapshot.manifest)
+    report.update(data_dir=str(snapshot.root), input_sha256=snapshot.hashes)
     other = snapshot.root / "ci_index_member"
     if other.exists():
         ci = read_snapshot(snapshot.root, "ci_index_member")
@@ -237,13 +246,15 @@ def plan_patch(snapshot: Snapshot) -> tuple[pa.Table, dict]:
 
 @contextmanager
 def archive_lock(root: Path):
-    """Advisory lock between instances of THIS helper; sync does not use it."""
-    with (root / ".industry_patch.lock").open("a+b") as handle:
+    """Share the archive writer lock with sync_tushare."""
+    with (root / ".sync.lock").open("a+b") as handle:
         try:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
-            raise PatchError("Another industry patch process holds the archive lock") from exc
+            raise PatchError("Another sync/patch process holds the archive lock") from exc
         try:
+            if any((root / "_transactions").glob("*/journal.json")):
+                raise PatchError("Interrupted sync commit exists; rerun sync to recover before patching")
             yield
         finally:
             fcntl.flock(handle, fcntl.LOCK_UN)
