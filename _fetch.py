@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import datetime as dt
+from email.utils import parsedate_to_datetime
 import random
 import threading
 import time
 from typing import Any, Callable, Mapping, Sequence
 
 import pandas as pd
-import tushare as ts
+import requests
 
 from _models import (
     ConfigurationError,
@@ -68,7 +69,7 @@ class RateLimiter:
 
 
 class ApiFetcher:
-    """Thread-safe facade around one Tushare client per worker thread."""
+    """Strict API transport with one reusable HTTP session per worker thread."""
 
     def __init__(
         self,
@@ -88,19 +89,66 @@ class ApiFetcher:
         self.max_retries = max(1, max_retries)
         self.rate_limiter = RateLimiter(request_interval)
         self._local = threading.local()
+        self._sessions: list[requests.Session] = []
+        self._sessions_lock = threading.Lock()
         self._query_override = query_override
         self.page_overlap = page_overlap
 
-    def _client(self) -> Any:
-        client = getattr(self._local, "client", None)
-        if client is None:
-            client = ts.pro_api(self._token, timeout=self.timeout)
-            client._DataApi__http_url = self.api_url
-            self._local.client = client
-        return client
+    def _session(self) -> requests.Session:
+        session = getattr(self._local, "session", None)
+        if session is None:
+            session = requests.Session()
+            self._local.session = session
+            with self._sessions_lock:
+                self._sessions.append(session)
+        return session
+
+    def close(self) -> None:
+        """Release connections after all workers have finished."""
+        with self._sessions_lock:
+            for session in self._sessions:
+                session.close()
+            self._sessions.clear()
+        self._local = threading.local()
+
+    def _request(self, api_name: str, fields_csv: str, params: Mapping[str, Any]) -> pd.DataFrame:
+        query = dict(params)
+        query.setdefault("ts_type_name", self.api_url)
+        # Preserve the installed proxy SDK's wire protocol.
+        payload = {"api_name": api_name, "token": self._token,
+                   "params": query, "fields": fields_csv}
+        with self._session().post(f"{self.api_url}/{api_name}", json=payload,
+                                  timeout=self.timeout, allow_redirects=False) as response:
+            if not 200 <= response.status_code < 300:
+                raise requests.HTTPError(f"HTTP {response.status_code}", response=response)
+            try:
+                result = response.json()
+            except ValueError as exc:
+                raise SourceSchemaError(f"{api_name}: HTTP {response.status_code}, invalid JSON") from exc
+            if not isinstance(result, dict) or type(result.get("code")) is not int:
+                raise SourceSchemaError(f"{api_name}: missing or invalid business code")
+            if result["code"] != 0:
+                message = str(result.get("msg", "unspecified business error"))
+                if self._token:
+                    message = message.replace(self._token, "[REDACTED]")
+                raise SyncError(f"business code={result['code']}: {message}")
+            data = result.get("data")
+            if not isinstance(data, dict):
+                raise SourceSchemaError(f"{api_name}: missing data object")
+            columns, items = data.get("fields"), data.get("items")
+            if (not isinstance(columns, list) or not columns
+                    or not all(isinstance(column, str) and column for column in columns)
+                    or len(set(columns)) != len(columns)
+                    or not isinstance(items, list)
+                    or any(not isinstance(row, list) or len(row) != len(columns) for row in items)):
+                raise SourceSchemaError(f"{api_name}: invalid fields/items structure")
+            return pd.DataFrame(items, columns=columns)
 
     @staticmethod
     def _is_non_retryable(exc: BaseException) -> bool:
+        if isinstance(exc, requests.HTTPError) and exc.response is not None:
+            status = exc.response.status_code
+            return status not in {408, 429} and not 500 <= status < 600
         message = str(exc).lower().replace(" ", "")
         return any(part.lower().replace(" ", "") in message for part in NON_RETRYABLE_MESSAGE_PARTS)
 
@@ -110,31 +158,57 @@ class ApiFetcher:
         fields_csv: str,
         params: Mapping[str, Any],
     ) -> pd.DataFrame:
+        context = {key: params[key] for key in (
+            "ann_date", "f_ann_date", "start_date", "end_date", "trade_date",
+            "period", "report_type", "is_new", "offset", "limit"
+        ) if key in params}
         for attempt in range(1, self.max_retries + 1):
             self.rate_limiter.wait()
+            started = time.monotonic()
+            LOGGER.debug("%s request start params=%s attempt=%s/%s", api_name, context,
+                         attempt, self.max_retries)
             try:
                 if self._query_override is not None:
                     result = self._query_override(api_name, fields_csv, params)
                 else:
-                    result = self._client().query(api_name, fields=fields_csv, **dict(params))
+                    result = self._request(api_name, fields_csv, params)
                 if not isinstance(result, pd.DataFrame):
                     raise SourceSchemaError(
                         f"{api_name} returned {type(result).__name__}, expected pandas.DataFrame"
                     )
+                LOGGER.debug("%s request complete params=%s rows=%s elapsed=%.2fs",
+                             api_name, context, len(result), time.monotonic() - started)
                 return result
             except SourceSchemaError:
                 raise
             except Exception as exc:
+                message = str(exc).replace(self._token, "[REDACTED]") if self._token else str(exc)
                 if self._is_non_retryable(exc) or attempt >= self.max_retries:
-                    raise SyncError(f"{api_name} request failed: {exc}") from exc
+                    raise SyncError(f"{api_name} request failed params={context}: {message}") from exc
                 delay = min(30.0, (2 ** (attempt - 1)) + random.random())
+                if isinstance(exc, requests.HTTPError) and exc.response is not None:
+                    retry_after = exc.response.headers.get("Retry-After")
+                    if retry_after:
+                        try:
+                            seconds = float(retry_after)
+                        except ValueError:
+                            try:
+                                seconds = (parsedate_to_datetime(retry_after)
+                                           - dt.datetime.now(dt.timezone.utc)).total_seconds()
+                            except (ValueError, TypeError, OverflowError):
+                                seconds = 0.0
+                        if seconds > 60:
+                            raise SyncError(f"{api_name}: {message}; Retry-After exceeds 60s; rerun later") from exc
+                        delay = max(delay, seconds)
                 LOGGER.warning(
-                    "%s transient request failure (attempt %s/%s); retrying in %.1fs: %s",
+                    "%s transient request failure params=%s elapsed=%.2fs (attempt %s/%s); retrying in %.1fs: %s",
                     api_name,
+                    context,
+                    time.monotonic() - started,
                     attempt,
                     self.max_retries,
                     delay,
-                    exc,
+                    message,
                 )
                 time.sleep(delay)
         raise AssertionError("unreachable")
@@ -156,6 +230,7 @@ class ApiFetcher:
         pages = 0
         last_page_rows = 0
         offset = 0
+        started = last_progress = time.monotonic()
 
         while True:
             params = dict(base_params)
@@ -165,6 +240,11 @@ class ApiFetcher:
             page_rows = len(raw_page)
             last_page_rows = page_rows
             raw_rows += page_rows
+            now = time.monotonic()
+            if now - last_progress >= 10:
+                LOGGER.info("%s pagination params=%s offset=%s pages=%s raw_rows=%s elapsed=%.1fs",
+                            spec.name, dict(base_params), offset, pages, raw_rows, now - started)
+                last_progress = now
             if page_rows > spec.page_size:
                 raise SourceSchemaError(
                     f"{spec.api_name} returned {page_rows} rows for limit={spec.page_size}"
@@ -248,8 +328,13 @@ def discover_financial_periods(
         raise ConfigurationError(f"{spec.name} lacks discovery fields {names}")
     periods: set[str] = set()
     pages = raw_rows = 0
-    for day in calendar_dates(start, end):
-        report_types = [str(value) for value in range(1, 13)] if spec.mode == "statement" else [None]
+    started = time.monotonic()
+    total_days = (end - start).days + 1
+    report_types = [str(value) for value in range(1, 13)] if spec.mode == "statement" else [None]
+    LOGGER.info("%s discovery start %s=%s..%s days=%s report_types=%s minimum_requests=%s",
+                spec.name, date_field, format_date(start), format_date(end), total_days,
+                len(report_types), total_days * len(report_types))
+    for day_number, day in enumerate(calendar_dates(start, end), 1):
         for report_type in report_types:
             params = {date_field: day}
             if report_type is not None:
@@ -271,13 +356,18 @@ def discover_financial_periods(
                     raise SourceSchemaError(f"{spec.name}: {exc}") from exc
                 if parsed >= archive_start:
                     periods.add(period)
+        LOGGER.info("%s discovery progress %s=%s days=%s/%s pages=%s raw_rows=%s periods=%s elapsed=%.1fs",
+                    spec.name, date_field, day, day_number, total_days, pages, raw_rows,
+                    len(periods), time.monotonic() - started)
     audit = {
         "date_field": date_field, "start_date": format_date(start),
         "end_date": format_date(end), "pages": pages, "raw_rows": raw_rows,
         "periods": sorted(periods),
+        "elapsed_seconds": round(time.monotonic() - started, 3),
     }
-    LOGGER.info("%s discovery %s=%s..%s periods=%s", spec.name, date_field,
-                audit["start_date"], audit["end_date"], audit["periods"])
+    LOGGER.info("%s discovery complete %s=%s..%s pages=%s raw_rows=%s elapsed=%.1fs periods=%s",
+                spec.name, date_field, audit["start_date"], audit["end_date"], pages,
+                raw_rows, audit["elapsed_seconds"], audit["periods"])
     return periods, audit
 
 

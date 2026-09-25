@@ -4,7 +4,8 @@ data/
 
 .DS_Store
 patch_reports/
-tests/
+tests/*
+!tests/test_http_fetch.py
 industry_patch_backups/
 data_attachments/
 reports/

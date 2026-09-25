@@ -81,39 +81,42 @@ def run_backfill(args: argparse.Namespace) -> int:
     selected = parse_api_selection(args.apis)
     fields_by_dataset = load_all_fields(args.docs_dir)
     fetcher = build_fetcher(args)
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    failures: list[tuple[str, Exception]] = []
-    for spec in selected:
-        targets = targets_for_range(spec, start, end)
-        LOGGER.info("starting %s with %s target partition(s)", spec.name, len(targets))
-        try:
-            process_dataset(
-                fetcher=fetcher,
-                output_dir=args.output_dir,
-                docs_dir=args.docs_dir,
-                spec=spec,
-                fields=fields_by_dataset[spec.name],
-                targets=targets,
-                range_start=args.start_date,
-                range_end=args.end_date,
-                workers=args.workers,
-                force=args.force,
-                resume=True,
-                allow_shrink=args.allow_shrink,
-                run_id=getattr(args, "run_id", None),
+        failures: list[tuple[str, Exception]] = []
+        for spec in selected:
+            targets = targets_for_range(spec, start, end)
+            LOGGER.info("starting %s with %s target partition(s)", spec.name, len(targets))
+            try:
+                process_dataset(
+                    fetcher=fetcher,
+                    output_dir=args.output_dir,
+                    docs_dir=args.docs_dir,
+                    spec=spec,
+                    fields=fields_by_dataset[spec.name],
+                    targets=targets,
+                    range_start=args.start_date,
+                    range_end=args.end_date,
+                    workers=args.workers,
+                    force=args.force,
+                    resume=True,
+                    allow_shrink=args.allow_shrink,
+                    run_id=getattr(args, "run_id", None),
+                )
+            except Exception as exc:
+                failures.append((spec.name, exc))
+                LOGGER.error("dataset %s did not complete: %s", spec.name, exc)
+
+        if failures:
+            detail = "; ".join(f"{name}: {exc}" for name, exc in failures)
+            raise DatasetRunError(
+                f"backfill incomplete for {len(failures)} dataset(s). Rerun the same command to resume. {detail}"
             )
-        except Exception as exc:
-            failures.append((spec.name, exc))
-            LOGGER.error("dataset %s did not complete: %s", spec.name, exc)
-
-    if failures:
-        detail = "; ".join(f"{name}: {exc}" for name, exc in failures)
-        raise DatasetRunError(
-            f"backfill incomplete for {len(failures)} dataset(s). Rerun the same command to resume. {detail}"
-        )
-    write_catalog(args.output_dir, args.start_date, args.end_date, selected, "backfill")
-    return 0
+        write_catalog(args.output_dir, args.start_date, args.end_date, selected, "backfill")
+        return 0
+    finally:
+        fetcher.close()
 
 
 def run_update(args: argparse.Namespace) -> int:
@@ -127,114 +130,117 @@ def run_update(args: argparse.Namespace) -> int:
     selected = parse_api_selection(args.apis)
     fields_by_dataset = load_all_fields(args.docs_dir)
     fetcher = build_fetcher(args)
-    run_id = getattr(args, "run_id", None) or uuid.uuid4().hex
-    manifests, discovered, audits, windows = {}, {}, {}, {}
-    failures: list[tuple[str, Exception]] = []
-    failed = set()
+    try:
+        run_id = getattr(args, "run_id", None) or uuid.uuid4().hex
+        manifests, discovered, audits, windows = {}, {}, {}, {}
+        failures: list[tuple[str, Exception]] = []
+        failed = set()
 
-    # Discover all selected financial datasets first. Persist recipient work
-    # before any source advances its date cursor, so cross-dataset triggers
-    # survive a recipient failure or process interruption.
-    for spec in selected:
-        try:
-            manifest = prepare_manifest(
-                args.output_dir, spec, fields_by_dataset[spec.name], args.docs_dir,
-                fetcher.api_url, False, catalog["archive_start"], args.as_of,
-            )
-            manifests[spec.name] = manifest
-            state = manifest.get("update_state", {})
-            if state.get("discovery_through", "") > args.as_of:
-                raise ConfigurationError(f"{spec.name}: --as-of is before the successful date cursor")
-            if spec.name in FINANCIAL_UPDATE_DATES:
-                start = update_window_start(manifest, archive_start, as_of, args.announcement_lookback_days)
-                windows[spec.name] = format_date(start)
-                discovered[spec.name], audits[spec.name] = discover_financial_periods(
-                    fetcher, spec, fields_by_dataset[spec.name], start, as_of, archive_start,
+        # Discover all selected financial datasets first. Persist recipient work
+        # before any source advances its date cursor, so cross-dataset triggers
+        # survive a recipient failure or process interruption.
+        for spec in selected:
+            try:
+                manifest = prepare_manifest(
+                    args.output_dir, spec, fields_by_dataset[spec.name], args.docs_dir,
+                    fetcher.api_url, False, catalog["archive_start"], args.as_of,
                 )
-                atomic_write_json(args.output_dir / "_runs" / run_id / f"{spec.name}_discovery.json", audits[spec.name])
-            elif spec.mode == "event":
-                windows[spec.name] = format_date(update_window_start(manifest, archive_start, as_of, args.event_lookback_days))
-        except Exception as exc:
-            failures.append((spec.name, exc))
-            failed.add(spec.name)
-            LOGGER.error("%s discovery/preparation failed: %s", spec.name, exc)
+                manifests[spec.name] = manifest
+                state = manifest.get("update_state", {})
+                if state.get("discovery_through", "") > args.as_of:
+                    raise ConfigurationError(f"{spec.name}: --as-of is before the successful date cursor")
+                if spec.name in FINANCIAL_UPDATE_DATES:
+                    start = update_window_start(manifest, archive_start, as_of, args.announcement_lookback_days)
+                    windows[spec.name] = format_date(start)
+                    discovered[spec.name], audits[spec.name] = discover_financial_periods(
+                        fetcher, spec, fields_by_dataset[spec.name], start, as_of, archive_start,
+                    )
+                    atomic_write_json(args.output_dir / "_runs" / run_id / f"{spec.name}_discovery.json", audits[spec.name])
+                elif spec.mode == "event":
+                    windows[spec.name] = format_date(update_window_start(manifest, archive_start, as_of, args.event_lookback_days))
+            except Exception as exc:
+                failures.append((spec.name, exc))
+                failed.add(spec.name)
+                LOGGER.error("%s discovery/preparation failed: %s", spec.name, exc)
 
-    owed = {name: set(manifest.get("update_state", {}).get("pending_periods", [])) | discovered.get(name, set())
-            for name, manifest in manifests.items() if name in FINANCIAL_UPDATE_DATES}
-    for source, recipients in {
-        "income": ("balancesheet", "fina_indicator"),
-        "cashflow": ("balancesheet", "fina_indicator"),
-        "balancesheet": ("fina_indicator",),
-    }.items():
-        for recipient in recipients:
-            if (recipient in {spec.name for spec in selected} and recipient not in manifests
-                    and discovered.get(source)):
-                raise DatasetRunError(
-                    f"cannot persist {source}'s pending quarters for {recipient}; "
-                    "repair its manifest/schema before advancing update dates"
-                )
-            if recipient in owed:
-                owed[recipient].update(discovered.get(source, set()))
-    # Keep pending triggers even for a recipient whose discovery failed today.
-    for spec in selected:
-        if spec.name not in manifests:
-            continue
-        manifest = manifests[spec.name]
-        state = manifest.setdefault("update_state", {})
-        if spec.name in owed:
-            state["pending_periods"] = sorted(owed[spec.name])
-        if spec.name in windows:
-            previous_start = state.get("pending_window_start", windows[spec.name])
-            state["pending_window_start"] = min(previous_start, windows[spec.name])
-        atomic_write_json(manifest_path(args.output_dir, spec), manifest)
-
-    for spec in selected:
-        if spec.name in failed:
-            continue
-        manifest = manifests[spec.name]
-        rotation = []
-        refresh_recent = True
-        if spec.name in FINANCIAL_UPDATE_DATES:
-            refresh_recent = spec.name == "balancesheet" or not manifest["update_state"].get("discovery_through")
-            rotation = historical_rotation(manifest, archive_start, as_of,
-                                           args.financial_lookback_quarters if refresh_recent else 0,
-                                           args.history_quarters_per_run)
-        targets = update_targets(
-            spec, manifest, archive_start, as_of, args.financial_lookback_quarters,
-            args.event_lookback_days, args.daily_lookback_days,
-            discovered_periods=sorted(owed.get(spec.name, set())),
-            historical_periods=rotation, refresh_recent=refresh_recent,
-        )
-        LOGGER.info("updating %s with %s target partition(s)", spec.name, len(targets))
-        try:
-            manifest = process_dataset(
-                fetcher=fetcher, output_dir=args.output_dir, docs_dir=args.docs_dir,
-                spec=spec, fields=fields_by_dataset[spec.name], targets=targets,
-                range_start=catalog["archive_start"], range_end=args.as_of,
-                workers=args.workers, force=False, resume=False,
-                allow_shrink=args.allow_shrink, run_id=run_id,
-            )
+        owed = {name: set(manifest.get("update_state", {}).get("pending_periods", [])) | discovered.get(name, set())
+                for name, manifest in manifests.items() if name in FINANCIAL_UPDATE_DATES}
+        for source, recipients in {
+            "income": ("balancesheet", "fina_indicator"),
+            "cashflow": ("balancesheet", "fina_indicator"),
+            "balancesheet": ("fina_indicator",),
+        }.items():
+            for recipient in recipients:
+                if (recipient in {spec.name for spec in selected} and recipient not in manifests
+                        and discovered.get(source)):
+                    raise DatasetRunError(
+                        f"cannot persist {source}'s pending quarters for {recipient}; "
+                        "repair its manifest/schema before advancing update dates"
+                    )
+                if recipient in owed:
+                    owed[recipient].update(discovered.get(source, set()))
+        # Keep pending triggers even for a recipient whose discovery failed today.
+        for spec in selected:
+            if spec.name not in manifests:
+                continue
+            manifest = manifests[spec.name]
             state = manifest.setdefault("update_state", {})
-            state["last_successful_as_of"] = args.as_of
-            if spec.name in FINANCIAL_UPDATE_DATES or spec.mode == "event":
-                state["discovery_through"] = args.as_of
-                state.pop("pending_window_start", None)
-            if spec.name in FINANCIAL_UPDATE_DATES:
-                state["pending_periods"] = []
-                state["last_discovery"] = audits[spec.name]
-                if rotation:
-                    state["history_cursor"] = rotation[-1]
-            manifest["updated_at"] = now_iso()
+            if spec.name in owed:
+                state["pending_periods"] = sorted(owed[spec.name])
+            if spec.name in windows:
+                previous_start = state.get("pending_window_start", windows[spec.name])
+                state["pending_window_start"] = min(previous_start, windows[spec.name])
             atomic_write_json(manifest_path(args.output_dir, spec), manifest)
-        except Exception as exc:
-            failures.append((spec.name, exc))
-            LOGGER.error("dataset %s update did not complete: %s", spec.name, exc)
 
-    if failures:
-        detail = "; ".join(f"{name}: {exc}" for name, exc in failures)
-        raise DatasetRunError(f"update incomplete for {len(failures)} dataset(s). {detail}")
-    write_catalog(args.output_dir, catalog["archive_start"], args.as_of, selected, "update")
-    return 0
+        for spec in selected:
+            if spec.name in failed:
+                continue
+            manifest = manifests[spec.name]
+            rotation = []
+            refresh_recent = True
+            if spec.name in FINANCIAL_UPDATE_DATES:
+                refresh_recent = spec.name == "balancesheet" or not manifest["update_state"].get("discovery_through")
+                rotation = historical_rotation(manifest, archive_start, as_of,
+                                               args.financial_lookback_quarters if refresh_recent else 0,
+                                               args.history_quarters_per_run)
+            targets = update_targets(
+                spec, manifest, archive_start, as_of, args.financial_lookback_quarters,
+                args.event_lookback_days, args.daily_lookback_days,
+                discovered_periods=sorted(owed.get(spec.name, set())),
+                historical_periods=rotation, refresh_recent=refresh_recent,
+            )
+            LOGGER.info("updating %s with %s target partition(s)", spec.name, len(targets))
+            try:
+                manifest = process_dataset(
+                    fetcher=fetcher, output_dir=args.output_dir, docs_dir=args.docs_dir,
+                    spec=spec, fields=fields_by_dataset[spec.name], targets=targets,
+                    range_start=catalog["archive_start"], range_end=args.as_of,
+                    workers=args.workers, force=False, resume=False,
+                    allow_shrink=args.allow_shrink, run_id=run_id,
+                )
+                state = manifest.setdefault("update_state", {})
+                state["last_successful_as_of"] = args.as_of
+                if spec.name in FINANCIAL_UPDATE_DATES or spec.mode == "event":
+                    state["discovery_through"] = args.as_of
+                    state.pop("pending_window_start", None)
+                if spec.name in FINANCIAL_UPDATE_DATES:
+                    state["pending_periods"] = []
+                    state["last_discovery"] = audits[spec.name]
+                    if rotation:
+                        state["history_cursor"] = rotation[-1]
+                manifest["updated_at"] = now_iso()
+                atomic_write_json(manifest_path(args.output_dir, spec), manifest)
+            except Exception as exc:
+                failures.append((spec.name, exc))
+                LOGGER.error("dataset %s update did not complete: %s", spec.name, exc)
+
+        if failures:
+            detail = "; ".join(f"{name}: {exc}" for name, exc in failures)
+            raise DatasetRunError(f"update incomplete for {len(failures)} dataset(s). {detail}")
+        write_catalog(args.output_dir, catalog["archive_start"], args.as_of, selected, "update")
+        return 0
+    finally:
+        fetcher.close()
 
 
 def _smoke_params(spec: DatasetSpec, args: argparse.Namespace) -> dict[str, Any]:
@@ -254,52 +260,55 @@ def run_smoke(args: argparse.Namespace) -> int:
     selected = parse_api_selection(args.apis)
     fields_by_dataset = load_all_fields(args.docs_dir)
     fetcher = build_fetcher(args)
-    failures: list[tuple[str, Exception]] = []
+    try:
+        failures: list[tuple[str, Exception]] = []
 
-    for spec in selected:
-        fields = fields_by_dataset[spec.name]
-        fields_csv = ",".join(field.name for field in fields)
-        base = _smoke_params(spec, args)
-        try:
-            page0 = fetcher.query_page(
-                spec.api_name,
-                fields_csv,
-                {**base, "limit": 10, "offset": 0},
+        for spec in selected:
+            fields = fields_by_dataset[spec.name]
+            fields_csv = ",".join(field.name for field in fields)
+            base = _smoke_params(spec, args)
+            try:
+                page0 = fetcher.query_page(
+                    spec.api_name,
+                    fields_csv,
+                    {**base, "limit": 10, "offset": 0},
+                )
+                page1 = fetcher.query_page(
+                    spec.api_name,
+                    fields_csv,
+                    {**base, "limit": 10, "offset": 10},
+                )
+                normalized0, missing0 = normalize_frame(
+                    page0,
+                    fields,
+                    spec.allowed_missing_fields,
+                    spec.name,
+                )
+                normalized1, missing1 = normalize_frame(
+                    page1,
+                    fields,
+                    spec.allowed_missing_fields,
+                    spec.name,
+                )
+                overlap = len(set(row_hashes(normalized0)) & set(row_hashes(normalized1)))
+                LOGGER.info(
+                    "SMOKE %s page0=%s page1=%s overlap=%s missing=%s",
+                    spec.name,
+                    len(page0),
+                    len(page1),
+                    overlap,
+                    sorted(missing0 | missing1),
+                )
+            except Exception as exc:
+                failures.append((spec.name, exc))
+                LOGGER.error("SMOKE %s failed: %s", spec.name, exc)
+        if failures:
+            raise DatasetRunError(
+                "smoke test failures: " + "; ".join(f"{name}: {exc}" for name, exc in failures)
             )
-            page1 = fetcher.query_page(
-                spec.api_name,
-                fields_csv,
-                {**base, "limit": 10, "offset": 10},
-            )
-            normalized0, missing0 = normalize_frame(
-                page0,
-                fields,
-                spec.allowed_missing_fields,
-                spec.name,
-            )
-            normalized1, missing1 = normalize_frame(
-                page1,
-                fields,
-                spec.allowed_missing_fields,
-                spec.name,
-            )
-            overlap = len(set(row_hashes(normalized0)) & set(row_hashes(normalized1)))
-            LOGGER.info(
-                "SMOKE %s page0=%s page1=%s overlap=%s missing=%s",
-                spec.name,
-                len(page0),
-                len(page1),
-                overlap,
-                sorted(missing0 | missing1),
-            )
-        except Exception as exc:
-            failures.append((spec.name, exc))
-            LOGGER.error("SMOKE %s failed: %s", spec.name, exc)
-    if failures:
-        raise DatasetRunError(
-            "smoke test failures: " + "; ".join(f"{name}: {exc}" for name, exc in failures)
-        )
-    return 0
+        return 0
+    finally:
+        fetcher.close()
 
 
 def run_verify(args: argparse.Namespace) -> int:
