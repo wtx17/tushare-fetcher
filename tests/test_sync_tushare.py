@@ -654,6 +654,38 @@ def test_discovery_fails_if_proxy_ignores_predicate() -> None:
                                         dt.date(2024, 9, 24), dt.date(2024, 1, 1))
 
 
+def test_empty_discovery_date_allows_successful_update(tmp_path, monkeypatch) -> None:
+    fields = {"forecast": [sync.FieldSpec(name, "str") for name in
+                            ("ts_code", "ann_date", "end_date")]}
+    rows = [
+        {"ts_code": "A", "ann_date": "20240301", "end_date": "20240331"},
+        {"ts_code": "B", "ann_date": "20240402", "end_date": "20240630"},
+    ]
+    calls = []
+
+    def query(_api, projection, params):
+        if "ann_date" in params:
+            calls.append(params["ann_date"])
+            selected = [row for row in rows if row["ann_date"] == params["ann_date"]]
+        else:
+            selected = [row for row in rows if row["end_date"] == params["period"]]
+        return pd.DataFrame(selected, columns=projection.split(","))
+
+    fetcher = sync.ApiFetcher("t", "unused", query_override=query, request_interval=0)
+    monkeypatch.setattr(sync, "build_fetcher", lambda _args: fetcher)
+    monkeypatch.setattr(sync, "load_all_fields", lambda _path: fields)
+    common = ["--output-dir", str(tmp_path), "--apis", "forecast"]
+    assert sync.main(["backfill", *common, "--start-date", "20240301", "--end-date", "20240331"]) == 0
+    update = ["update", *common, "--as-of", "20240402", "--announcement-lookback-days", "1",
+              "--history-quarters-per-run", "0"]
+    assert sync.main(update) == 0
+    state = sync.load_json(sync.manifest_path(tmp_path, sync.DATASET_BY_NAME["forecast"]))["update_state"]
+    assert "20240401" in calls
+    assert "20240402" in calls
+    assert state["discovery_through"] == "20240402"
+    assert state["pending_periods"] == []
+
+
 def _sync_rows(root, rows, *, spec=_DEMO_SPEC, fields=_DEMO_FIELDS, query=None, key="20240331", **options):
     fetcher = sync.ApiFetcher("t", "unused", request_interval=0, page_overlap=0,
                               query_override=lambda _a, _f, _p: pd.DataFrame(rows))

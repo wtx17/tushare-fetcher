@@ -136,6 +136,10 @@ class ApiFetcher:
             if not isinstance(data, dict):
                 raise SourceSchemaError(f"{api_name}: missing data object")
             columns, items = data.get("fields"), data.get("items")
+            if columns == [] and items == []:
+                LOGGER.warning("%s returned empty fields/items params=%s; treating as empty result",
+                               api_name, dict(params))
+                return pd.DataFrame(columns=fields_csv.split(","))
             if (not isinstance(columns, list) or not columns
                     or not all(isinstance(column, str) and column for column in columns)
                     or len(set(columns)) != len(columns)

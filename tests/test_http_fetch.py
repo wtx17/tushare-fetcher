@@ -125,6 +125,18 @@ def test_malformed_success_is_error(transport, payload):
     assert not sleeps
 
 
+def test_empty_fields_and_items_become_empty_frame_with_warning(transport, caplog):
+    fetcher, session, _, sleeps = transport
+    session.responses = [response(payload={"code": 0, "data": {"fields": [], "items": []}})]
+    with caplog.at_level(logging.WARNING, logger="sync_tushare"):
+        frame = fetcher.query_page("forecast_vip", "ts_code,ann_date,end_date",
+                                   {"ann_date": "20260919"})
+    assert frame.empty and list(frame.columns) == ["ts_code", "ann_date", "end_date"]
+    assert len(session.calls) == 1 and not sleeps
+    assert "WARNING" in caplog.text and "20260919" in caplog.text
+    assert not any(record.levelno >= logging.ERROR for record in caplog.records)
+
+
 def test_invalid_json_is_error(transport):
     fetcher, session, _, _ = transport
     invalid = response()
