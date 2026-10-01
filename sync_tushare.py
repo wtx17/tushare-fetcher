@@ -64,13 +64,30 @@ def parse_api_selection(value: str) -> list[DatasetSpec]:
 
 def build_fetcher(args: argparse.Namespace) -> ApiFetcher:
     token = os.environ.get("TUSHARE_TOKEN", "")
-    return ApiFetcher(
+    fetcher = ApiFetcher(
         token=token,
         api_url=args.api_url,
         timeout=args.timeout,
         max_retries=args.max_retries,
         request_interval=args.request_interval,
     )
+    LOGGER.info("runtime python=%s version=%s api_host=%s token=configured",
+                sys.executable, sys.version.split()[0], urlparse(args.api_url).hostname)
+    if args.command in {"backfill", "update", "latest"}:
+        # A single small read detects global DNS/auth/IP failures before thousands
+        # of partition jobs are queued. It never writes archive data.
+        spec = parse_api_selection(args.apis)[0]
+        probe_args = argparse.Namespace(period="20241231", event_start="20240101",
+                                        event_end="20240131", trade_date="20240102")
+        params = {**_smoke_params(spec, probe_args), "limit": 1, "offset": 0}
+        try:
+            LOGGER.info("preflight %s: checking network and account access", spec.api_name)
+            fetcher.query_page(spec.api_name, "ts_code", params)
+            LOGGER.info("preflight passed; starting archive work")
+        except Exception:
+            fetcher.close()
+            raise
+    return fetcher
 
 
 def run_backfill(args: argparse.Namespace) -> int:
@@ -243,6 +260,30 @@ def run_update(args: argparse.Namespace) -> int:
         fetcher.close()
 
 
+def run_latest(args: argparse.Namespace) -> int:
+    """Bootstrap/resume an archive when needed, then catch up to Shanghai today."""
+    start = parse_yyyymmdd(args.start_date, "--start-date")
+    end = parse_yyyymmdd(args.as_of, "--as-of")
+    if start > end:
+        raise ConfigurationError("--start-date must not be after --as-of")
+    selected = parse_api_selection(args.apis)
+    catalog = load_json(catalog_path(args.output_dir))
+    needs_backfill = (
+        not catalog
+        or not {spec.name for spec in selected}.issubset(catalog.get("datasets", []))
+        or start < parse_yyyymmdd(catalog["archive_start"], "archive_start")
+    )
+    if needs_backfill:
+        LOGGER.info("latest: completing resumable backfill %s..%s", args.start_date, args.as_of)
+        args.end_date = args.as_of
+        args.force = False
+        status = run_backfill(args)
+        if status:
+            return status
+    LOGGER.info("latest: updating archive through %s", args.as_of)
+    return run_update(args)
+
+
 def _smoke_params(spec: DatasetSpec, args: argparse.Namespace) -> dict[str, Any]:
     if spec.mode in {"statement", "period"}:
         params: dict[str, Any] = {"period": args.period}
@@ -385,6 +426,20 @@ def add_common_options(parser: argparse.ArgumentParser, include_network: bool = 
         add_network_options(parser)
 
 
+def add_update_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--as-of", default=format_date(dt.datetime.now(ZoneInfo("Asia/Shanghai")).date()))
+    parser.add_argument("--financial-lookback-quarters", type=int, default=8)
+    parser.add_argument("--announcement-lookback-days", type=int, default=7,
+                        help="financial publication-date overlap, including the successful cursor day")
+    parser.add_argument("--event-lookback-days", type=int, default=7)
+    parser.add_argument("--history-quarters-per-run", type=int, default=1,
+                        help="older quarters to rotate per financial dataset per run (0 disables)")
+    parser.add_argument("--daily-lookback-days", type=int, default=7,
+                        help="refresh this many recent calendar dates for daily datasets")
+    parser.add_argument("--allow-shrink", action="store_true",
+                        help="permit empty responses or loss of more than half the unique rows")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -408,25 +463,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     update = subparsers.add_parser("update", help="incrementally update an existing archive")
     add_common_options(update)
-    update.add_argument("--as-of", default=format_date(dt.datetime.now(ZoneInfo("Asia/Shanghai")).date()))
-    update.add_argument("--financial-lookback-quarters", type=int, default=8)
-    update.add_argument("--announcement-lookback-days", type=int, default=7,
-                        help="financial publication-date overlap, including the successful cursor day")
-    update.add_argument("--event-lookback-days", type=int, default=7)
-    update.add_argument("--history-quarters-per-run", type=int, default=1,
-                        help="older quarters to rotate per financial dataset per run (0 disables)")
-    update.add_argument(
-        "--daily-lookback-days",
-        type=int,
-        default=7,
-        help="refresh this many recent calendar dates for daily datasets",
-    )
-    update.add_argument(
-        "--allow-shrink",
-        action="store_true",
-        help="permit empty responses or loss of more than half the unique rows",
-    )
+    add_update_options(update)
     update.set_defaults(handler=run_update)
+
+    latest = subparsers.add_parser("latest", help="resume initial backfill if needed, then update to today")
+    add_common_options(latest)
+    add_update_options(latest)
+    latest.add_argument("--start-date", default="20160720",
+                        help="archive start date for initial/resumed backfill (default: 20160720)")
+    latest.set_defaults(handler=run_latest)
 
     verify = subparsers.add_parser("verify", help="verify local Parquet and manifests offline")
     add_common_options(verify, include_network=False)
@@ -483,7 +528,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         validate_cli_args(args)
         args.output_dir = args.output_dir.resolve()
         args.docs_dir = args.docs_dir.resolve()
-        if args.command in {"backfill", "update"}:
+        if args.command in {"backfill", "update", "latest"}:
             with archive_lock(args.output_dir):
                 args.run_id = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "_" + uuid.uuid4().hex[:8]
                 log_dir = args.output_dir / "_runs" / args.run_id

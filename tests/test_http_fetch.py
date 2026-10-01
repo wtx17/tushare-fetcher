@@ -154,6 +154,56 @@ def test_business_permission_error_redacts_token(transport):
     assert "secret-token" not in str(error.value) and not sleeps
 
 
+@pytest.mark.parametrize("message", ["ip超限，请不到在多个ip同时使用", "多个IP同时使用"])
+def test_multi_ip_account_limit_is_not_retried(transport, message):
+    fetcher, session, _, sleeps = transport
+    session.responses = [response(payload={"code": 500, "msg": message + " secret-token"})]
+    with pytest.raises(sync.SyncError, match="stop tasks") as error:
+        fetcher.query_page("income_vip", "ts_code", {})
+    assert len(session.calls) == 1 and not sleeps
+    assert "secret-token" not in str(error.value)
+
+
+@pytest.mark.parametrize("failure, hint", [
+    (response(payload={"code": 500, "msg": "ip超限，请不到在多个ip同时使用"}), "stop tasks"),
+    (requests.ConnectionError("Failed to resolve 'example.invalid'"), "check DNS"),
+])
+def test_startup_failure_aborts_before_partition_work(transport, monkeypatch, tmp_path, caplog,
+                                                    failure, hint):
+    _, session, _, sleeps = transport
+    monkeypatch.setenv("TUSHARE_TOKEN", "secret-token")
+    session.responses = [failure]
+    existing = tmp_path / "existing.parquet"
+    existing.write_bytes(b"existing archive data")
+    with caplog.at_level(logging.INFO, logger="sync_tushare"):
+        assert sync.main(["backfill", "--apis", "forecast", "--output-dir", str(tmp_path),
+                          "--start-date", "20160720", "--end-date", "20261001",
+                          "--max-retries", "1"]) == 1
+    assert len(session.calls) == 1 and not sleeps and session.closed
+    assert session.calls[0][1]["json"]["params"]["limit"] == 1
+    assert existing.read_bytes() == b"existing archive data"
+    assert not list(tmp_path.glob("**/_manifest.json"))
+    assert not (tmp_path / "_catalog.json").exists()
+    assert hint in caplog.text and "secret-token" not in caplog.text
+
+
+def test_successful_startup_probe_then_backfill(transport, monkeypatch, tmp_path):
+    _, session, _, _ = transport
+    monkeypatch.setenv("TUSHARE_TOKEN", "secret-token")
+    fields = [sync.FieldSpec(name, "str") for name in ("ts_code", "ann_date", "end_date")]
+    monkeypatch.setattr(sync, "load_all_fields", lambda _: {"forecast": fields})
+    session.responses = [response(), response(payload={"code": 0, "data": {
+        "fields": [field.name for field in fields],
+        "items": [["600000.SH", "20240320", "20240331"]]}})]
+    assert sync.main(["backfill", "--apis", "forecast", "--output-dir", str(tmp_path),
+                      "--start-date", "20240101", "--end-date", "20240401"]) == 0
+    assert len(session.calls) == 2 and session.closed
+    assert session.calls[0][1]["json"]["params"]["limit"] == 1
+    assert session.calls[1][1]["json"]["params"]["period"] == "20240331"
+    partition = sync.partition_file(tmp_path, sync.DATASET_BY_NAME["forecast"], "20240331")
+    assert partition.exists() and (tmp_path / "_catalog.json").exists()
+
+
 def test_pagination_does_not_advance_after_http_failure(transport):
     import dataclasses
     fetcher, session, _, _ = transport

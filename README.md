@@ -5,7 +5,10 @@
 ## 环境与命令
 
 ```bash
-conda activate qt  # 使用该环境配置的 TUSHARE_TOKEN
+conda activate quant  # 在当前环境中配置 TUSHARE_TOKEN
+
+# 自动补到上海时区当天：初次或未完成回填时先续传，已有归档时增量更新
+python sync_tushare.py latest
 
 # 全量回填；已有旧版分区会重新按 200 行重叠分页抓取
 python sync_tushare.py backfill --start-date 20160720 --end-date 20260925
@@ -19,6 +22,9 @@ python sync_tushare.py verify
 
 `update` 需要已有成功回填生成的 `_catalog.json`。命令适合被外部调度器每天调用；本项目不自动安装定时任务。
 同一归档只允许一个写入进程，抓取器和独立行业补丁共用 `.sync.lock`。
+
+`latest` 默认归档起点为 `20160720`，结束日期在每次启动时按上海时区计算。没有完整 catalog、所选数据集尚未回填，或要求更早的起点时，先执行可续传的回填；成功后增量更新。已有归档时直接执行 `update`。可用 `--start-date`、`--as-of`、`--apis` 和其他更新参数调整范围；失败时不继续后续阶段，再运行相同命令即可恢复。
+“截至当天”表示查询到当天，数据仍取决于上游实际发布时间；交易日数据不会凭空生成。
 
 ## 全量回填与分页
 
@@ -91,10 +97,12 @@ data/
 
 ## HTTP 请求与扫描进度
 
+- `backfill` / `update` / `latest` 在排队抓取分区前，先对首个所选接口做一次 `limit=1` 的只读检查。DNS、账号或多 IP 限制导致检查失败时立即退出，不逐个分区重复失败。启动日志记录 Python 路径、版本和 API 域名，便于比较不同机器的运行环境。
 - 请求层直接校验 HTTP 状态、业务码及 `fields/items` 结构。只有合法的成功响应才会生成数据表；合法的空 `items` 表示无数据，HTTP 错误和异常响应不会被当作空表。
 - 代理返回 `fields=[]、items=[]` 时记 WARNING，并按请求字段生成空表；每日指标的非交易日可以保存空分区，更新正常继续。
 - 连接错误、超时、HTTP 408/429/5xx 按原参数和原 offset 重试；其他 HTTP 错误及明确的权限、参数错误直接失败。重试次数使用 `--max-retries`，含首次请求。非法 JSON 或数据结构直接报错。
 - 重试采用指数退避；有效的 `Retry-After` 可延长等待。若服务端要求等待超过 60 秒，本次请求失败并提示稍后重跑，避免提前重试。
+- 代理返回 `ip超限` / `多个IP同时使用` 时直接失败，并提示暂停其他设备上使用同一 Token 的任务；不要同时在 Mac 和本机的不同出口 IP 上回填。
 - 每个工作线程复用一个 HTTP Session，命令结束或异常退出时关闭连接。响应内容中的业务成功不代表远端一定没有漏返回数据。
 - 公告扫描开始时记录日期窗口、天数及最少请求数，每完成一天输出累计页数、行数、发现季度数和耗时。单次分页持续超过 10 秒时，在请求完成后补充分页进度；单次请求等待仍受 `--timeout` 控制。
 - `--log-level DEBUG` 可查看每次请求的日期、报表类型、offset 和耗时。重试输出警告日志，token 不写入日志。扫描总耗时也保存在对应的 discovery 审计 JSON 中。
@@ -128,7 +136,7 @@ data/
 ## 测试
 
 ```bash
-conda activate qt
+conda activate quant
 python -m pytest -q
 ```
 

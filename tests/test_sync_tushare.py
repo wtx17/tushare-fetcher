@@ -967,7 +967,7 @@ def test_update_replaces_full_quarter_and_keeps_failed_cross_dataset_work(tmp_pa
     assert income_state["discovery_through"] == "20240926"
 
 
-@pytest.mark.parametrize("command", ["backfill", "update", "verify", "smoke"])
+@pytest.mark.parametrize("command", ["backfill", "update", "latest", "verify", "smoke"])
 def test_cli_help_renders(command, capsys) -> None:
     with pytest.raises(SystemExit) as result:
         sync.build_parser().parse_args([command, "--help"])
@@ -978,3 +978,54 @@ def test_cli_help_renders(command, capsys) -> None:
 def test_null_report_period_is_rejected() -> None:
     with pytest.raises(sync.SourceSchemaError, match="end_date"):
         sync.validate_period_frame(pd.DataFrame({"end_date": [None]}), "20240331", "demo")
+
+
+def test_latest_resumes_failed_bootstrap_then_discovers_new_revision(tmp_path, monkeypatch) -> None:
+    fields = [sync.FieldSpec(name, "str") for name in ("ts_code", "ann_date", "end_date")]
+    records = {
+        "20240331": [{"ts_code": "600000.SH", "ann_date": "20240320", "end_date": "20240331"}],
+        "20240630": [{"ts_code": "600000.SH", "ann_date": "20240620", "end_date": "20240630"}],
+    }
+    queries = []
+    available = False
+
+    def query(_api, fields_csv, params):
+        queries.append(dict(params))
+        if "period" in params:
+            if params["period"] == "20240630" and not available:
+                raise sync.SyncError("temporary upstream failure")
+            rows = records.get(params["period"], [])
+        else:
+            rows = [row for group in records.values() for row in group
+                    if row["ann_date"] == params["ann_date"]]
+        return pd.DataFrame(rows, columns=fields_csv.split(","))
+
+    fetcher = sync.ApiFetcher("t", "unused", query_override=query, request_interval=0, max_retries=1)
+    monkeypatch.setattr(sync, "build_fetcher", lambda _: fetcher)
+    monkeypatch.setattr(sync, "load_all_fields", lambda _: {"forecast": fields})
+    common = ["latest", "--apis", "forecast", "--output-dir", str(tmp_path),
+              "--start-date", "20240101", "--history-quarters-per-run", "0"]
+    assert sync.main([*common, "--as-of", "20240630"]) == 1
+    spec = sync.DATASET_BY_NAME["forecast"]
+    first_partition = sync.partition_file(tmp_path, spec, "20240331")
+    before = first_partition.read_bytes()
+    assert not sync.catalog_path(tmp_path).exists()
+    assert not any("ann_date" in params for params in queries)
+
+    available = True
+    queries.clear()
+    assert sync.main([*common, "--as-of", "20240630"]) == 0
+    # Resume starts at the failed quarter; a later update can refresh both quarters.
+    assert queries[0]["period"] == "20240630"
+    assert first_partition.read_bytes() == before
+    assert sync.load_json(sync.catalog_path(tmp_path))["archive_end"] == "20240630"
+    assert sync.load_json(sync.manifest_path(tmp_path, spec))["update_state"]["discovery_through"] == "20240630"
+
+    records["20240331"][0]["ann_date"] = "20240701"
+    queries.clear()
+    assert sync.main([*common, "--as-of", "20240701"]) == 0
+    # An established archive uses announcement discovery, rather than restarting backfill.
+    assert "ann_date" in queries[0]
+    assert list(pd.read_parquet(first_partition).ann_date) == ["20240701"]
+    assert sync.load_json(sync.catalog_path(tmp_path))["archive_end"] == "20240701"
+    assert sync.main(["verify", "--apis", "forecast", "--output-dir", str(tmp_path)]) == 0
