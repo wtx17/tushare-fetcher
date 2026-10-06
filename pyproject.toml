@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tushare-fetcher"
+version = "0.0.0"
+description = "Local Tushare Parquet archive tools"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = ["pandas>=2.2,<3", "pyarrow>=18,<24", "requests>=2.31,<3"]
+
+[tool.setuptools]
+py-modules = ["_fetch", "_models", "_pipeline", "_schema", "_storage", "patch_industry_data", "sync_tushare"]
