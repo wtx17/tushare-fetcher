@@ -48,6 +48,8 @@ NON_RETRYABLE_MESSAGE_PARTS = (
     "字段错误",
     "接口不存在",
     "api_name不存在",
+    "ip超限",
+    "多个ip同时使用",
 )
 
 
@@ -188,6 +190,13 @@ class ApiFetcher:
             except Exception as exc:
                 message = str(exc).replace(self._token, "[REDACTED]") if self._token else str(exc)
                 if self._is_non_retryable(exc) or attempt >= self.max_retries:
+                    compact = message.lower().replace(" ", "")
+                    if "ip超限" in compact or "多个ip同时使用" in compact:
+                        message += "; stop tasks using this token on other devices/IPs, then retry on one device"
+                    elif any(part in message.lower() for part in (
+                        "nameresolutionerror", "failed to resolve", "temporary failure in name resolution"
+                    )):
+                        message += "; check DNS in the Python runtime environment (WSL DNS is separate from Windows DNS)"
                     raise SyncError(f"{api_name} request failed params={context}: {message}") from exc
                 delay = min(30.0, (2 ** (attempt - 1)) + random.random())
                 if isinstance(exc, requests.HTTPError) and exc.response is not None:
